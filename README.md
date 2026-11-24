@@ -38,6 +38,14 @@ bash start.sh
 
 The web app and API are served together on the port in `data/IDE.config` (default `8866`). Compose stores the SQLite database, workspaces, APK artifacts, and config in `./data`. `HOST_DATA_DIR` is set by the startup script to the absolute host path needed when Docker mounts a project into an isolated build container.
 
+## Install and offline editing
+
+The web UI is a PWA and requires HTTPS (or localhost). Open it online once and let the initial asset download finish before going offline; this caches the app shell and Monaco editor locally in the browser (about 18 MB of static Monaco assets). Use **Install** in the top bar when the browser supports installation, or its menu's **Install app / Add to Home Screen** option.
+
+Projects and editor state live in that browser's IndexedDB, so they can be created, opened, and edited offline. In private mode, a browser that has logged in successfully can still open its local workspace offline; no password is stored, only a local unlock marker, which is removed on logout. Clearing browser site data also clears projects and the offline unlock.
+
+APK builds, build history/logs, server storage management, and other API-backed operations still require the server connection. They are not queued while offline. The service worker caches static app/Monaco assets only and always sends `/api/*` requests to the network.
+
 ## Access mode
 
 Edit `data/IDE.config`; access mode is not controlled from the web UI. The service reads config at startup, so apply changes with `bash start.sh restart`.

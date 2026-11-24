@@ -4,7 +4,7 @@ import Dexie, { type Table } from 'dexie'
 import JSZip from 'jszip'
 import {
   Box, ChevronRight, Copy, Download, FileCode2, FilePlus2, FolderPlus, HardDrive,
-  LogOut, Menu, PackagePlus, Play, Search, Trash2, Upload,
+  LogOut, Menu, PackagePlus, Play, Search, Smartphone, Trash2, Upload, WifiOff,
   X,
 } from 'lucide-react'
 import './App.css'
@@ -62,6 +62,10 @@ type CleanupOptions = {
 }
 
 type AuthStatus = { mode: 'public' | 'private'; authenticated: boolean }
+type InstallPromptEvent = Event & {
+  prompt: () => Promise<void>
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>
+}
 
 type ManifestFile = {
   path: string
@@ -81,6 +85,8 @@ type ProjectEditorState = {
 }
 
 const editorStateKey = (projectId: string) => `android-web-ide.editorState.${projectId}`
+const accessModeKey = 'android-web-ide.accessMode'
+const offlineUnlockKey = 'android-web-ide.offlineUnlock'
 const defaultExpandedPaths = ['app', 'app/src', 'app/src/main']
 
 function readProjectEditorState(projectId: string): ProjectEditorState | null {
@@ -296,6 +302,11 @@ function App() {
   const [loginPassword, setLoginPassword] = useState('')
   const [loginError, setLoginError] = useState('')
   const [loginLoading, setLoginLoading] = useState(false)
+  const [isOnline, setIsOnline] = useState(navigator.onLine)
+  const [serverAvailable, setServerAvailable] = useState(true)
+  const [offlineUnlocked, setOfflineUnlocked] = useState(() => localStorage.getItem(offlineUnlockKey) === 'true')
+  const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null)
+  const [isInstalled, setIsInstalled] = useState(false)
   const [cleanupOptions, setCleanupOptions] = useState<CleanupOptions>({
     workspaces: true, artifacts: true, history: false, gradleCache: false,
   })
@@ -303,7 +314,12 @@ function App() {
   const buildEvents = useRef<EventSource | null>(null)
   const [buildHistory, setBuildHistory] = useState<Build[]>([])
   const [restoreProjectId] = useState(() => localStorage.getItem('android-web-ide.activeProjectId'))
-  const authenticated = authStatus?.mode === 'public' || authStatus?.authenticated === true
+  const cachedAccessMode = localStorage.getItem(accessModeKey)
+  const authMode = authStatus?.mode ?? (cachedAccessMode === 'public' ? 'public' : 'private')
+  const onlineAccess = isOnline && serverAvailable
+  const authenticated = authStatus?.mode === 'public' || authStatus?.authenticated === true ||
+    (!serverAvailable && authMode === 'public') ||
+    (!serverAvailable && authMode === 'private' && offlineUnlocked)
   const activeProject = projects.find(p => p.id === activeProjectId) ?? null
   const activeFile = files.find(f => f.id === activeFileId) ?? null
 
@@ -314,15 +330,87 @@ function App() {
         if (!response.ok) throw new Error(await response.text())
         return response.json() as Promise<AuthStatus>
       })
-      .then(status => { if (!disposed) setAuthStatus(status) })
+      .then(status => {
+        if (disposed) return
+        setAuthStatus(status)
+        setServerAvailable(true)
+        setIsOnline(navigator.onLine)
+        localStorage.setItem(accessModeKey, status.mode)
+        if (status.mode === 'private' && status.authenticated) {
+          localStorage.setItem(offlineUnlockKey, 'true')
+          setOfflineUnlocked(true)
+        }
+      })
       .catch(error => {
-        if (!disposed) setLoginError(error instanceof Error ? error.message : 'gagal menghubungi server')
+        if (disposed) return
+        setServerAvailable(false)
+        setIsOnline(navigator.onLine)
+        setLoginError(error instanceof Error ? error.message : 'gagal menghubungi server')
       })
     return () => { disposed = true }
   }, [])
 
   useEffect(() => {
-    if (authStatus?.mode !== 'private' || !authStatus.authenticated) return
+    const handleOffline = () => {
+      setIsOnline(false)
+      setServerAvailable(false)
+      setStorageOpen(false)
+      buildEvents.current?.close()
+      buildEvents.current = null
+    }
+    const handleOnline = () => {
+      setIsOnline(true)
+      fetch('/api/auth/status')
+        .then(async response => {
+          if (!response.ok) throw new Error(await response.text())
+          return response.json() as Promise<AuthStatus>
+        })
+        .then(status => {
+          setServerAvailable(true)
+          setAuthStatus(status)
+          localStorage.setItem(accessModeKey, status.mode)
+          if (status.mode === 'private' && status.authenticated) {
+            localStorage.setItem(offlineUnlockKey, 'true')
+            setOfflineUnlocked(true)
+          }
+          setLoginError('')
+        })
+        .catch(error => {
+          setServerAvailable(false)
+          setStorageOpen(false)
+          setLoginError(error instanceof Error ? error.message : 'gagal menghubungi server')
+        })
+    }
+    const handleInstallPrompt = (event: Event) => {
+      event.preventDefault()
+      setInstallPrompt(event as InstallPromptEvent)
+    }
+    const handleInstalled = () => {
+      setIsInstalled(true)
+      setInstallPrompt(null)
+    }
+    const handlePwaError = (event: Event) => {
+      const error = (event as CustomEvent<string>).detail
+      setToast(`PWA gagal disiapkan: ${error}`)
+    }
+    setIsInstalled(window.matchMedia('(display-mode: standalone)').matches ||
+      ('standalone' in navigator && navigator.standalone === true))
+    window.addEventListener('offline', handleOffline)
+    window.addEventListener('online', handleOnline)
+    window.addEventListener('beforeinstallprompt', handleInstallPrompt)
+    window.addEventListener('appinstalled', handleInstalled)
+    window.addEventListener('ide:pwa-error', handlePwaError)
+    return () => {
+      window.removeEventListener('offline', handleOffline)
+      window.removeEventListener('online', handleOnline)
+      window.removeEventListener('beforeinstallprompt', handleInstallPrompt)
+      window.removeEventListener('appinstalled', handleInstalled)
+      window.removeEventListener('ide:pwa-error', handlePwaError)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!onlineAccess || authStatus?.mode !== 'private' || !authStatus.authenticated) return
     const timer = window.setInterval(() => {
       fetch('/api/auth/status')
         .then(response => response.ok ? response.json() as Promise<AuthStatus> : null)
@@ -332,10 +420,12 @@ function App() {
             setLoginError('session berakhir, masuk lagi untuk melanjutkan')
           }
         })
-        .catch(() => undefined)
+        .catch(() => {
+          setServerAvailable(false)
+        })
     }, 30_000)
     return () => window.clearInterval(timer)
-  }, [authStatus])
+  }, [authStatus, onlineAccess])
 
   useEffect(() => {
     if (!authenticated) return
@@ -398,7 +488,7 @@ function App() {
   useEffect(() => {
     buildEvents.current?.close()
     buildEvents.current = null
-    if (!authenticated || !activeProjectId) {
+    if (!onlineAccess || !authenticated || !activeProjectId) {
       setBuildHistory([])
       setBuildId(null)
       setBuildStatus('idle')
@@ -434,7 +524,7 @@ function App() {
       buildEvents.current?.close()
       buildEvents.current = null
     }
-  }, [activeProjectId, authenticated])
+  }, [activeProjectId, authenticated, onlineAccess])
 
   useEffect(() => {
     if (!toast) return
@@ -459,6 +549,11 @@ function App() {
       const body = await response.json() as { error?: string; authenticated?: boolean }
       if (!response.ok) throw new Error(body.error || 'login gagal')
       setAuthStatus({ mode: 'private', authenticated: true })
+      setServerAvailable(true)
+      setIsOnline(true)
+      localStorage.setItem(accessModeKey, 'private')
+      localStorage.setItem(offlineUnlockKey, 'true')
+      setOfflineUnlocked(true)
       setLoginPassword('')
     } catch (error) {
       setLoginError(error instanceof Error ? error.message : 'login gagal')
@@ -468,24 +563,34 @@ function App() {
   }
 
   async function logout() {
-    try {
-      await fetch('/api/auth/logout', { method: 'POST' })
-      buildEvents.current?.close()
-      setAuthStatus({ mode: 'private', authenticated: false })
-      setActiveProjectId(null)
-      setProjects([])
-      setFiles([])
-      setBuildHistory([])
-      setBuildId(null)
-      setBuildStatus('idle')
-      setLogs([])
-      setBuildOpen(false)
-    } catch (error) {
-      setToast(error instanceof Error ? error.message : 'logout gagal')
+    const shouldNotifyServer = onlineAccess
+    localStorage.removeItem(offlineUnlockKey)
+    setOfflineUnlocked(false)
+    buildEvents.current?.close()
+    setAuthStatus({ mode: 'private', authenticated: false })
+    setActiveProjectId(null)
+    setProjects([])
+    setFiles([])
+    setBuildHistory([])
+    setBuildId(null)
+    setBuildStatus('idle')
+    setLogs([])
+    setBuildOpen(false)
+    if (shouldNotifyServer) {
+      try {
+        const response = await fetch('/api/auth/logout', { method: 'POST' })
+        if (!response.ok) throw new Error(await response.text() || 'logout server gagal')
+      } catch (error) {
+        setToast(error instanceof Error ? error.message : 'logout server gagal')
+      }
     }
   }
 
   async function refreshStorageStats() {
+    if (!onlineAccess) {
+      setToast('Kelola storage build butuh koneksi ke server')
+      return
+    }
     setStorageLoading(true)
     try {
       const response = await fetch('/api/maintenance/storage')
@@ -499,10 +604,18 @@ function App() {
   }
 
   function openStorage() {
+    if (!onlineAccess) {
+      setToast('Kelola storage build butuh koneksi ke server')
+      return
+    }
     setStorageOpen(true)
   }
 
   async function cleanStorage() {
+    if (!onlineAccess) {
+      setToast('Pembersihan storage build butuh koneksi ke server')
+      return
+    }
     if (!Object.values(cleanupOptions).some(Boolean)) {
       setToast('Pilih data yang mau dibersihkan')
       return
@@ -708,12 +821,17 @@ function App() {
   }
 
   async function startBuild() {
+    if (!onlineAccess) {
+      setToast('Build APK butuh koneksi ke server')
+      return
+    }
     if (!activeProject) return
     if (buildStatus === 'preparing' || buildStatus === 'assembling' ||
         buildStatus === 'queued' || buildStatus === 'building') {
       setBuildOpen(true)
       return
     }
+
     const buildFiles = await ensureGeneratedJvmTargets(activeProject, files)
     if (buildFiles !== files) setFiles(buildFiles)
     const invalidReason = validateBuildProject(activeProject, buildFiles)
@@ -797,6 +915,21 @@ function App() {
     }
   }
 
+  async function installApp() {
+    if (!installPrompt) {
+      setToast('Buka menu browser lalu pilih "Install app" atau "Add to Home Screen"')
+      return
+    }
+    try {
+      await installPrompt.prompt()
+      const choice = await installPrompt.userChoice
+      if (choice.outcome === 'accepted') setToast('Android Web IDE berhasil dipasang')
+      setInstallPrompt(null)
+    } catch (error) {
+      setToast(error instanceof Error ? `gagal memasang app: ${error.message}` : 'gagal memasang app')
+    }
+  }
+
   function renderTree(nodes: TreeNode[], depth = 0) {
     return nodes.map(node => (
       <div key={node.path}>
@@ -833,11 +966,11 @@ function App() {
     ))
   }
 
-  if (!authStatus) {
-    return <LoginScreen loading={!loginError} error={loginError} onSubmit={submitLogin} password={loginPassword} onPasswordChange={setLoginPassword} busy={loginLoading}/>
+  if (!authStatus && !(!serverAvailable && (authMode === 'public' || (authMode === 'private' && offlineUnlocked)))) {
+    return <LoginScreen loading={!loginError && serverAvailable} offline={!onlineAccess} error={loginError} onSubmit={submitLogin} password={loginPassword} onPasswordChange={setLoginPassword} busy={loginLoading}/>
   }
-  if (authStatus.mode === 'private' && !authenticated) {
-    return <LoginScreen error={loginError} onSubmit={submitLogin} password={loginPassword} onPasswordChange={setLoginPassword} busy={loginLoading}/>
+  if (authMode === 'private' && !authenticated) {
+    return <LoginScreen offline={!onlineAccess} error={loginError} onSubmit={submitLogin} password={loginPassword} onPasswordChange={setLoginPassword} busy={loginLoading}/>
   }
 
   return (
@@ -846,11 +979,13 @@ function App() {
         <button className="icon-btn" onClick={() => setDrawerOpen(v => !v)}><Menu size={20}/></button>
         <div className="brand"><div className="brand-mark"><Box size={18}/></div><span>Droid Studio</span></div>
         {activeProject && <div className="project-title">{activeProject.name}</div>}
-        <button className="build-btn" onClick={startBuild} disabled={!activeProject || buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building'}>
-          <Play size={16} fill="currentColor"/><span>{buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building' ? 'Building...' : 'Build APK'}</span>
+        {!onlineAccess && <div className="offline-indicator"><WifiOff size={14}/><span>offline · edit lokal</span></div>}
+        {!isInstalled && <button className="install-btn" title="Install Android Web IDE" onClick={() => void installApp()}><Smartphone size={16}/><span>Install</span></button>}
+        <button className="build-btn" onClick={startBuild} disabled={!onlineAccess || !activeProject || buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building'} title={!onlineAccess ? 'Build APK butuh koneksi ke server' : undefined}>
+          <Play size={16} fill="currentColor"/><span>{!onlineAccess ? 'Offline' : buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building' ? 'Building...' : 'Build APK'}</span>
         </button>
-        <button className="icon-btn storage-btn" title="Kelola storage build" onClick={openStorage}><HardDrive size={18}/></button>
-        {authStatus.mode === 'private' && <button className="icon-btn" title="Logout" onClick={logout}><LogOut size={18}/></button>}
+        <button className="icon-btn storage-btn" title={onlineAccess ? 'Kelola storage build' : 'Perlu koneksi ke server'} onClick={openStorage} disabled={!onlineAccess}><HardDrive size={18}/></button>
+        {authMode === 'private' && <button className="icon-btn" title="Logout" onClick={logout}><LogOut size={18}/></button>}
       </header>
 
       <aside className={`sidebar ${drawerOpen ? 'open' : ''}`}>
@@ -963,8 +1098,9 @@ function App() {
   )
 }
 
-function LoginScreen({ loading, error, password, busy, onPasswordChange, onSubmit }: {
+function LoginScreen({ loading, offline, error, password, busy, onPasswordChange, onSubmit }: {
   loading?: boolean
+  offline?: boolean
   error: string
   password: string
   busy: boolean
@@ -977,11 +1113,11 @@ function LoginScreen({ loading, error, password, busy, onPasswordChange, onSubmi
         <div className="brand-mark"><Box size={20}/></div>
         <small>SELF-HOSTED ANDROID IDE</small>
         <h1>{loading ? 'menghubungkan…' : 'private workspace'}</h1>
-        <p>masukin password buat lanjut ke workspace.</p>
+        <p>{offline ? 'login perlu koneksi. akses offline tersedia setelah lu pernah login di browser ini.' : 'masukin password buat lanjut ke workspace.'}</p>
         <label>password<input type="password" autoComplete="current-password" value={password}
-          onChange={event => onPasswordChange(event.target.value)} autoFocus disabled={loading} required/></label>
+          onChange={event => onPasswordChange(event.target.value)} autoFocus disabled={loading || offline} required/></label>
         {error && <div className="login-error">{error}</div>}
-        <button className="primary-btn full" type="submit" disabled={busy || loading || !password}>
+        <button className="primary-btn full" type="submit" disabled={busy || loading || offline || !password}>
           {busy ? 'memeriksa…' : 'masuk'}
         </button>
       </form>
