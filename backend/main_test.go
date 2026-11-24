@@ -27,6 +27,107 @@ func TestAndroidBuilderImage(t *testing.T) {
 	}
 }
 
+func TestNotificationSettingsArePrivateAndDoNotExposeSMTPSecret(t *testing.T) {
+	db := testDB(t)
+	server := &Server{
+		db: db,
+		config: AppConfig{
+			Mode: "private",
+			SMTP: SMTPConfig{
+				Host: "smtp.example.test", Port: 587, Username: "sender@example.test",
+				Password: "smtp-secret", From: "sender@example.test",
+			},
+		},
+	}
+
+	request := httptest.NewRequest(http.MethodPut, "/api/notifications/settings",
+		strings.NewReader(`{"recipient":"receiver@example.test","notifySuccess":true,"notifyFailure":false}`))
+	response := httptest.NewRecorder()
+	server.handleNotificationSettings(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("save notification settings returned %d: %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "smtp-secret") || !strings.Contains(response.Body.String(), `"smtpConfigured":true`) {
+		t.Fatalf("SMTP credentials leaked or configured state missing: %s", response.Body.String())
+	}
+
+	publicServer := &Server{db: db, config: AppConfig{Mode: "public"}}
+	response = httptest.NewRecorder()
+	publicServer.handleNotificationSettings(response, httptest.NewRequest(http.MethodGet, "/api/notifications/settings", nil))
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("public mode settings returned %d, want forbidden", response.Code)
+	}
+}
+
+func TestNotificationTestRequiresSavedRecipientAndSMTP(t *testing.T) {
+	db := testDB(t)
+	server := &Server{db: db, config: AppConfig{Mode: "private"}}
+	if _, err := db.Exec(`UPDATE notification_settings SET recipient='receiver@example.test' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.handleNotificationTest(response, httptest.NewRequest(http.MethodPost, "/api/notifications/test", nil))
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "SMTP belum dikonfigurasi") {
+		t.Fatalf("test email without SMTP returned %d: %s", response.Code, response.Body.String())
+	}
+
+	if _, err := db.Exec(`UPDATE notification_settings SET recipient='' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	response = httptest.NewRecorder()
+	server.handleNotificationTest(response, httptest.NewRequest(http.MethodPost, "/api/notifications/test", nil))
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "email penerima") {
+		t.Fatalf("test email without recipient returned %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestBuildNotificationQueueRespectsSettingsAndDeduplicates(t *testing.T) {
+	db := testDB(t)
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, build := range []struct {
+		id     string
+		status string
+	}{
+		{id: "success-1", status: "success"},
+		{id: "failed-1", status: "failed"},
+	} {
+		if _, err := db.Exec(`INSERT INTO builds(id,project_id,status,variant,created_at,started_at,finished_at,error)
+			VALUES(?,?,?,?,?,?,?,?)`, build.id, "project-1", build.status, "debug", now, now, now,
+			map[string]string{"success": "", "failed": "Gradle build gagal"}[build.status]); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO build_logs(build_id,sequence,stream,message,created_at)
+			VALUES(?,1,'stderr','Execution failed',?)`, build.id, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE notification_settings SET recipient='receiver@example.test',
+		notify_success=1,notify_failure=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{db: db}
+	server.enqueueBuildNotification("success-1", "success")
+	server.enqueueBuildNotification("success-1", "success")
+	server.enqueueBuildNotification("failed-1", "failed")
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM email_outbox`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("queued %d messages, want one enabled deduplicated notification", count)
+	}
+	var recipient, subject, body, status string
+	if err := db.QueryRow(`SELECT recipient,subject,body,status FROM email_outbox WHERE build_id='success-1'`).
+		Scan(&recipient, &subject, &body, &status); err != nil {
+		t.Fatal(err)
+	}
+	if recipient != "receiver@example.test" || !strings.Contains(subject, "success-1") ||
+		!strings.Contains(body, "Project ID: project-1") || !strings.Contains(body, "Execution failed") || status != "pending" {
+		t.Fatalf("unexpected queued notification: recipient=%q subject=%q body=%q status=%q", recipient, subject, body, status)
+	}
+}
+
 func TestValidateAndroidProject(t *testing.T) {
 	root := t.TempDir()
 	if err := validateAndroidProject(root); err == nil || !strings.Contains(err.Error(), "settings.gradle") {

@@ -90,6 +90,14 @@ Example:
 
 In public mode, all app APIs—including cleanup—are public by design. Only use it when the host and its resources are intentionally open to visitors.
 
+## Build email notifications
+
+Email notification settings are global to this server and are available in private mode from the mail icon in the IDE. The recipient and success/failure toggles are stored in the server database. SMTP sender credentials are read only from `data/IDE.config`; the API never returns them to the browser. The tracked `IDE.config` contains blank placeholders only.
+
+For Gmail, enable 2-step verification, create an app password, and use it as the SMTP password (not the Google account password). Configure SMTP host `smtp.gmail.com`, port `587` (STARTTLS), sender username/email and the app password under the `smtp` section of `data/IDE.config`, then run `bash start.sh restart`. Port `465` with implicit TLS is also supported.
+
+The IDE sends a test email from the settings dialog. Build success/failure notifications are queued and retried after temporary SMTP errors or server restarts. Messages include build ID, project ID, variant, timestamps, duration, error and a short tail of build logs; the log excerpt can contain compiler context, but no APK is attached. Sent outbox entries are deleted after 30 days. Notification settings cannot be changed in public mode.
+
 Check that the API is ready:
 
 ```bash

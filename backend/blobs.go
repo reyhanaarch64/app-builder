@@ -641,9 +641,15 @@ func (s *Server) collectExpiredBlobReservations() error {
 	}
 	rows.Close()
 	for _, id := range expired {
-		if _, err := s.db.Exec(`UPDATE builds SET status='failed',finished_at=?,updated_at=?,error='reservation expired'
-			WHERE id=? AND status IN ('preparing','assembling')`, now, now, id); err != nil {
+		result, err := s.db.Exec(`UPDATE builds SET status='failed',finished_at=?,updated_at=?,error='reservation expired'
+			WHERE id=? AND status IN ('preparing','assembling')`, now, now, id)
+		if err != nil {
 			return err
+		}
+		if changed, err := result.RowsAffected(); err != nil {
+			return err
+		} else if changed > 0 {
+			s.enqueueBuildNotification(id, "failed")
 		}
 		if _, err := s.db.Exec(`DELETE FROM build_manifests WHERE build_id=?`, id); err != nil {
 			return err

@@ -3,7 +3,7 @@ import Editor from '@monaco-editor/react'
 import Dexie, { type Table } from 'dexie'
 import JSZip from 'jszip'
 import {
-  Box, ChevronRight, Copy, Download, FileCode2, FilePlus2, FolderPlus, HardDrive,
+  Box, ChevronRight, Copy, Download, FileCode2, FilePlus2, FolderPlus, HardDrive, Mail,
   LogOut, Menu, PackagePlus, Play, Search, Smartphone, Trash2, Upload, WifiOff,
   X,
 } from 'lucide-react'
@@ -62,6 +62,12 @@ type CleanupOptions = {
 }
 
 type AuthStatus = { mode: 'public' | 'private'; authenticated: boolean }
+type NotificationSettings = {
+  recipient: string
+  notifySuccess: boolean
+  notifyFailure: boolean
+  smtpConfigured: boolean
+}
 type InstallPromptEvent = Event & {
   prompt: () => Promise<void>
   userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>
@@ -298,6 +304,12 @@ function App() {
   const [storageOpen, setStorageOpen] = useState(false)
   const [storageLoading, setStorageLoading] = useState(false)
   const [storageStats, setStorageStats] = useState<StorageStats | null>(null)
+  const [notificationsOpen, setNotificationsOpen] = useState(false)
+  const [notificationSettings, setNotificationSettings] = useState<NotificationSettings | null>(null)
+  const [notificationLoading, setNotificationLoading] = useState(false)
+  const [notificationSaving, setNotificationSaving] = useState(false)
+  const [notificationTesting, setNotificationTesting] = useState(false)
+  const [notificationError, setNotificationError] = useState('')
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null)
   const [loginPassword, setLoginPassword] = useState('')
   const [loginError, setLoginError] = useState('')
@@ -930,6 +942,76 @@ function App() {
     }
   }
 
+  async function openNotifications() {
+    setNotificationsOpen(true)
+    setNotificationLoading(true)
+    setNotificationError('')
+    try {
+      const response = await fetch('/api/notifications/settings')
+      const data = await response.json() as NotificationSettings & { error?: string }
+      if (!response.ok) throw new Error(data.error || 'gagal membaca pengaturan email')
+      setNotificationSettings(data)
+    } catch (error) {
+      setNotificationError(error instanceof Error ? error.message : 'gagal membaca pengaturan email')
+    } finally {
+      setNotificationLoading(false)
+    }
+  }
+
+  async function saveNotificationSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!notificationSettings) return
+    setNotificationSaving(true)
+    setNotificationError('')
+    try {
+      const response = await fetch('/api/notifications/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recipient: notificationSettings.recipient,
+          notifySuccess: notificationSettings.notifySuccess,
+          notifyFailure: notificationSettings.notifyFailure,
+        }),
+      })
+      const data = await response.json() as NotificationSettings & { error?: string }
+      if (!response.ok) throw new Error(data.error || 'gagal menyimpan pengaturan email')
+      setNotificationSettings(data)
+      setToast('pengaturan email tersimpan')
+    } catch (error) {
+      setNotificationError(error instanceof Error ? error.message : 'gagal menyimpan pengaturan email')
+    } finally {
+      setNotificationSaving(false)
+    }
+  }
+
+  async function sendTestNotification() {
+    if (!notificationSettings) return
+    setNotificationTesting(true)
+    setNotificationError('')
+    try {
+      const saveResponse = await fetch('/api/notifications/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recipient: notificationSettings.recipient,
+          notifySuccess: notificationSettings.notifySuccess,
+          notifyFailure: notificationSettings.notifyFailure,
+        }),
+      })
+      const saved = await saveResponse.json() as NotificationSettings & { error?: string }
+      if (!saveResponse.ok) throw new Error(saved.error || 'gagal menyimpan pengaturan email')
+      setNotificationSettings(saved)
+      const response = await fetch('/api/notifications/test', { method: 'POST' })
+      const data = await response.json() as { error?: string }
+      if (!response.ok) throw new Error(data.error || 'email test gagal dikirim')
+      setToast('email test berhasil dikirim')
+    } catch (error) {
+      setNotificationError(error instanceof Error ? error.message : 'email test gagal dikirim')
+    } finally {
+      setNotificationTesting(false)
+    }
+  }
+
   function renderTree(nodes: TreeNode[], depth = 0) {
     return nodes.map(node => (
       <div key={node.path}>
@@ -984,6 +1066,7 @@ function App() {
         <button className="build-btn" onClick={startBuild} disabled={!onlineAccess || !activeProject || buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building'} title={!onlineAccess ? 'Build APK butuh koneksi ke server' : undefined}>
           <Play size={16} fill="currentColor"/><span>{!onlineAccess ? 'Offline' : buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building' ? 'Building...' : 'Build APK'}</span>
         </button>
+        {authMode === 'private' && <button className="icon-btn" title={onlineAccess ? 'Notifikasi email build' : 'Perlu koneksi ke server'} onClick={() => void openNotifications()} disabled={!onlineAccess}><Mail size={18}/></button>}
         <button className="icon-btn storage-btn" title={onlineAccess ? 'Kelola storage build' : 'Perlu koneksi ke server'} onClick={openStorage} disabled={!onlineAccess}><HardDrive size={18}/></button>
         {authMode === 'private' && <button className="icon-btn" title="Logout" onClick={logout}><LogOut size={18}/></button>}
       </header>
@@ -1093,7 +1176,76 @@ function App() {
           onClose={() => setStorageOpen(false)}
         />
       )}
+      {notificationsOpen && (
+        <NotificationDialog
+          settings={notificationSettings}
+          loading={notificationLoading}
+          saving={notificationSaving}
+          testing={notificationTesting}
+          error={notificationError}
+          onSettingsChange={setNotificationSettings}
+          onSave={saveNotificationSettings}
+          onTest={() => void sendTestNotification()}
+          onClose={() => setNotificationsOpen(false)}
+        />
+      )}
       {toast && <div className="toast">{toast}</div>}
+    </div>
+  )
+}
+
+function NotificationDialog({ settings, loading, saving, testing, error, onSettingsChange, onSave, onTest, onClose }: {
+  settings: NotificationSettings | null
+  loading: boolean
+  saving: boolean
+  testing: boolean
+  error: string
+  onSettingsChange: (settings: NotificationSettings | null) => void
+  onSave: (event: FormEvent<HTMLFormElement>) => void
+  onTest: () => void
+  onClose: () => void
+}) {
+  const busy = loading || saving || testing
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <form className="modal notification-modal" onMouseDown={event => event.stopPropagation()} onSubmit={onSave}>
+        <div className="modal-head">
+          <div><small>BUILD NOTIFICATIONS</small><h2>Email notifikasi</h2></div>
+          <button type="button" className="icon-btn" onClick={onClose}><X size={18}/></button>
+        </div>
+        {loading ? <p className="notification-info">memuat pengaturan…</p> : settings && (
+          <>
+            <div className={`notification-info ${settings.smtpConfigured ? 'configured' : 'not-configured'}`}>
+              {settings.smtpConfigured
+                ? 'SMTP siap. Kredensial pengirim disimpan di data/IDE.config.'
+                : 'SMTP belum dikonfigurasi. Isi bagian smtp di data/IDE.config lalu restart service.'}
+            </div>
+            <label>Email penerima
+              <input type="email" autoComplete="email" maxLength={320} value={settings.recipient}
+                onChange={event => onSettingsChange({ ...settings, recipient: event.target.value })}
+                placeholder="lu@example.com"/>
+            </label>
+            <div className="notification-options">
+              <label><input type="checkbox" checked={settings.notifySuccess}
+                onChange={event => onSettingsChange({ ...settings, notifySuccess: event.target.checked })}/>
+                <span><strong>Build berhasil</strong><small>kirim email saat APK selesai dibuat</small></span></label>
+              <label><input type="checkbox" checked={settings.notifyFailure}
+                onChange={event => onSettingsChange({ ...settings, notifyFailure: event.target.checked })}/>
+                <span><strong>Build gagal</strong><small>sertakan alasan dan cuplikan log terakhir</small></span></label>
+            </div>
+          </>
+        )}
+        {error && <div className="login-error">{error}</div>}
+        <div className="notification-actions">
+          <button type="button" className="tool-btn refresh-storage" onClick={onTest}
+            disabled={busy || !settings?.smtpConfigured || !settings.recipient}>
+            {testing ? 'mengirim…' : 'kirim email test'}
+          </button>
+          <button type="submit" className="primary-btn" disabled={busy || !settings}>
+            {saving ? 'menyimpan…' : 'simpan'}
+          </button>
+        </div>
+      </form>
     </div>
   )
 }

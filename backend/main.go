@@ -45,6 +45,14 @@ type BuildConfig struct {
 	Parallel       int `json:"parallel"`
 }
 
+type SMTPConfig struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	From     string `json:"from"`
+}
+
 type AppConfig struct {
 	Mode            string      `json:"mode"`
 	Password        string      `json:"password"`
@@ -52,6 +60,7 @@ type AppConfig struct {
 	SessionTTLHours int         `json:"sessionTTLHours"`
 	SecureCookie    bool        `json:"secureCookie"`
 	Build           BuildConfig `json:"build"`
+	SMTP            SMTPConfig  `json:"smtp"`
 }
 
 type session struct {
@@ -117,6 +126,8 @@ func main() {
 	mux.HandleFunc("/api/auth/status", s.handleAuthStatus)
 	mux.HandleFunc("/api/auth/login", s.handleLogin)
 	mux.HandleFunc("/api/auth/logout", s.handleLogout)
+	mux.HandleFunc("/api/notifications/settings", s.handleNotificationSettings)
+	mux.HandleFunc("/api/notifications/test", s.handleNotificationTest)
 	mux.HandleFunc("/api/builds", s.handleBuildCollection)
 	mux.HandleFunc("/api/builds/prepare", s.handleBuildPrepare)
 	mux.HandleFunc("/api/builds/", s.handleBuildRoutes)
@@ -124,6 +135,7 @@ func main() {
 	mux.HandleFunc("/api/maintenance/cleanup", s.handleCleanup)
 	mux.Handle("/", http.FileServer(http.Dir(webDir)))
 
+	go s.runEmailOutbox()
 	log.Printf("android web ide mode=%s listening on http://0.0.0.0:%d", config.Mode, config.Port)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", config.Port), s.authMiddleware(mux)))
 }
@@ -152,6 +164,30 @@ func schema(db *sql.DB) {
 		created_at TEXT NOT NULL
 	);`)
 	if err != nil {
+		log.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS notification_settings (
+		id INTEGER PRIMARY KEY CHECK(id=1),
+		recipient TEXT NOT NULL DEFAULT '',
+		notify_success INTEGER NOT NULL DEFAULT 1,
+		notify_failure INTEGER NOT NULL DEFAULT 1,
+		updated_at TEXT NOT NULL
+	); INSERT OR IGNORE INTO notification_settings(id,recipient,notify_success,notify_failure,updated_at)
+		VALUES(1,'',1,1,''); CREATE TABLE IF NOT EXISTS email_outbox (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		build_id TEXT NOT NULL,
+		event TEXT NOT NULL,
+		recipient TEXT NOT NULL,
+		subject TEXT NOT NULL,
+		body TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'pending',
+		attempts INTEGER NOT NULL DEFAULT 0,
+		next_attempt_at TEXT NOT NULL,
+		last_error TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		sent_at TEXT NOT NULL DEFAULT '',
+		UNIQUE(build_id,event)
+	); CREATE INDEX IF NOT EXISTS email_outbox_due ON email_outbox(status,next_attempt_at,id)`); err != nil {
 		log.Fatal(err)
 	}
 	var projectIDColumn int
@@ -226,6 +262,7 @@ func defaultConfig() AppConfig {
 	return AppConfig{
 		Mode: "public", Port: 8866, SessionTTLHours: 168, SecureCookie: true,
 		Build: BuildConfig{MaxUploadMB: 50, TimeoutMinutes: 30, MemoryMB: 4096, CPUs: 2, Parallel: 1},
+		SMTP:  SMTPConfig{Port: 587},
 	}
 }
 
@@ -270,6 +307,9 @@ func loadConfig(path string) (AppConfig, error) {
 		config.Build.CPUs < 1 || config.Build.CPUs > 64 ||
 		config.Build.Parallel < 1 || config.Build.Parallel > 16 {
 		return config, errors.New("IDE.config build limits are outside supported ranges")
+	}
+	if config.SMTP.Port < 0 || config.SMTP.Port > 65535 {
+		return config, errors.New("IDE.config smtp port must be 0 or between 1 and 65535")
 	}
 	if err := os.Chmod(path, 0600); err != nil {
 		return config, err
@@ -1211,9 +1251,18 @@ func (s *Server) runBuild(id, workspace string) {
 		s.failBuild(id, "gagal menjalankan Docker: "+err.Error())
 		return
 	}
-	go s.copyLogs(id, "stdout", stdout)
-	go s.copyLogs(id, "stderr", stderr)
+	var logWriters sync.WaitGroup
+	logWriters.Add(2)
+	go func() {
+		defer logWriters.Done()
+		s.copyLogs(id, "stdout", stdout)
+	}()
+	go func() {
+		defer logWriters.Done()
+		s.copyLogs(id, "stderr", stderr)
+	}()
 	err = cmd.Wait()
+	logWriters.Wait()
 	if ctx.Err() == context.DeadlineExceeded {
 		s.failBuild(id, fmt.Sprintf("build timeout %d menit", s.config.Build.TimeoutMinutes))
 		return
@@ -1240,8 +1289,12 @@ func (s *Server) runBuild(id, workspace string) {
 	input.Close()
 	output.Close()
 	s.addLog(id, "system", "APK berhasil dibuild")
-	s.db.Exec(`UPDATE builds SET status='success',finished_at=?,artifact=? WHERE id=?`,
-		time.Now().UTC().Format(time.RFC3339), filename, id)
+	if _, err := s.db.Exec(`UPDATE builds SET status='success',finished_at=?,artifact=? WHERE id=?`,
+		time.Now().UTC().Format(time.RFC3339), filename, id); err != nil {
+		log.Printf("failed to save success status for build %s: %v", id, err)
+		return
+	}
+	s.enqueueBuildNotification(id, "success")
 }
 
 func (s *Server) copyLogs(id, stream string, r io.ReadCloser) {
@@ -1284,8 +1337,12 @@ func androidBuilderImage() string {
 func (s *Server) failBuild(id, message string) {
 	s.addLog(id, "system", "Build gagal: "+message)
 	now := time.Now().UTC().Format(time.RFC3339)
-	s.db.Exec(`UPDATE builds SET status='failed',finished_at=?,updated_at=?,error=? WHERE id=?`,
-		now, now, message, id)
+	if _, err := s.db.Exec(`UPDATE builds SET status='failed',finished_at=?,updated_at=?,error=? WHERE id=?`,
+		now, now, message, id); err != nil {
+		log.Printf("failed to save failure status for build %s: %v", id, err)
+		return
+	}
+	s.enqueueBuildNotification(id, "failed")
 	s.db.Exec(`DELETE FROM build_manifests WHERE build_id=?`, id)
 	s.db.Exec(`DELETE FROM blob_reservations WHERE build_id=?`, id)
 }
