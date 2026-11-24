@@ -3,7 +3,7 @@ import Editor from '@monaco-editor/react'
 import Dexie, { type Table } from 'dexie'
 import JSZip from 'jszip'
 import {
-  Box, ChevronRight, Download, FileCode2, FilePlus2, FolderPlus, HardDrive,
+  Box, ChevronRight, Copy, Download, FileCode2, FilePlus2, FolderPlus, HardDrive,
   LogOut, Menu, PackagePlus, Play, Search, Trash2, Upload,
   X,
 } from 'lucide-react'
@@ -60,6 +60,35 @@ type CleanupOptions = {
 }
 
 type AuthStatus = { mode: 'public' | 'private'; authenticated: boolean }
+
+type ProjectEditorState = {
+  openFileIds: string[]
+  activeFileId: string | null
+  expanded: string[]
+}
+
+const editorStateKey = (projectId: string) => `android-web-ide.editorState.${projectId}`
+const defaultExpandedPaths = ['app', 'app/src', 'app/src/main']
+
+function readProjectEditorState(projectId: string): ProjectEditorState | null {
+  try {
+    const saved = localStorage.getItem(editorStateKey(projectId))
+    if (!saved) return null
+    const state = JSON.parse(saved) as Partial<ProjectEditorState>
+    if (!Array.isArray(state.openFileIds) ||
+        !state.openFileIds.every(id => typeof id === 'string') ||
+        !(state.activeFileId === null || typeof state.activeFileId === 'string') ||
+        !Array.isArray(state.expanded) ||
+        !state.expanded.every(path => typeof path === 'string')) return null
+    return {
+      openFileIds: state.openFileIds,
+      activeFileId: state.activeFileId,
+      expanded: state.expanded,
+    }
+  } catch {
+    return null
+  }
+}
 
 class IDEDatabase extends Dexie {
   projects!: Table<Project, string>
@@ -203,6 +232,7 @@ function App() {
   const [files, setFiles] = useState<ProjectFile[]>([])
   const [openTabs, setOpenTabs] = useState<ProjectFile[]>([])
   const [activeFileId, setActiveFileId] = useState<string | null>(null)
+  const [editorStateProjectId, setEditorStateProjectId] = useState<string | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [buildOpen, setBuildOpen] = useState(false)
   const [buildStatus, setBuildStatus] = useState<'idle' | 'queued' | 'building' | 'success' | 'failed' | 'canceled'>('idle')
@@ -210,7 +240,7 @@ function App() {
   const [buildId, setBuildId] = useState<string | null>(null)
   const [showCreate, setShowCreate] = useState(false)
   const [search, setSearch] = useState('')
-  const [expanded, setExpanded] = useState<Set<string>>(new Set(['app', 'app/src', 'app/src/main']))
+  const [expanded, setExpanded] = useState<Set<string>>(new Set(defaultExpandedPaths))
   const [toast, setToast] = useState('')
   const [storageOpen, setStorageOpen] = useState(false)
   const [storageLoading, setStorageLoading] = useState(false)
@@ -274,9 +304,49 @@ function App() {
   }, [activeProjectId])
 
   useEffect(() => {
-    if (!activeProjectId) { setFiles([]); return }
-    db.files.where('projectId').equals(activeProjectId).toArray().then(setFiles)
+    if (!activeProjectId) {
+      setFiles([])
+      setOpenTabs([])
+      setActiveFileId(null)
+      setEditorStateProjectId(null)
+      return
+    }
+    let disposed = false
+    setFiles([])
+    setEditorStateProjectId(null)
+    db.files.where('projectId').equals(activeProjectId).toArray().then(projectFiles => {
+      if (disposed) return
+      const state = readProjectEditorState(activeProjectId)
+      const filesById = new Map(projectFiles.map(file => [file.id, file] as const))
+      const restoredTabs = [...new Set(state?.openFileIds ?? [])]
+        .map(id => filesById.get(id))
+        .filter((file): file is ProjectFile => file !== undefined)
+      const restoredActiveFileId = state?.activeFileId && restoredTabs.some(file => file.id === state.activeFileId)
+        ? state.activeFileId
+        : restoredTabs.at(-1)?.id ?? null
+      setFiles(projectFiles)
+      setOpenTabs(restoredTabs)
+      setActiveFileId(restoredActiveFileId)
+      setExpanded(new Set(state?.expanded ?? defaultExpandedPaths))
+      setEditorStateProjectId(activeProjectId)
+    }).catch(error => {
+      if (!disposed) setToast(error instanceof Error ? error.message : 'gagal memuat file project')
+    })
+    return () => { disposed = true }
   }, [activeProjectId])
+
+  useEffect(() => {
+    if (!activeProjectId || editorStateProjectId !== activeProjectId) return
+    try {
+      localStorage.setItem(editorStateKey(activeProjectId), JSON.stringify({
+        openFileIds: openTabs.map(file => file.id),
+        activeFileId,
+        expanded: [...expanded],
+      } satisfies ProjectEditorState))
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'gagal menyimpan state editor')
+    }
+  }, [activeProjectId, editorStateProjectId, openTabs, activeFileId, expanded])
 
   useEffect(() => {
     buildEvents.current?.close()
@@ -463,6 +533,7 @@ function App() {
     if (!confirm(`Hapus project "${project.name}"?`)) return
     await db.files.where('projectId').equals(project.id).delete()
     await db.projects.delete(project.id)
+    localStorage.removeItem(editorStateKey(project.id))
     setProjects(prev => prev.filter(p => p.id !== project.id))
     if (activeProjectId === project.id) setActiveProjectId(null)
   }
@@ -577,6 +648,15 @@ function App() {
     })
   }
 
+  async function copyLogs() {
+    try {
+      await navigator.clipboard.writeText(logs.join('\n'))
+      setToast('log berhasil disalin')
+    } catch (error) {
+      setToast(error instanceof Error ? `gagal menyalin log: ${error.message}` : 'gagal menyalin log')
+    }
+  }
+
   async function startBuild() {
     if (!activeProject) return
     if (buildStatus === 'queued' || buildStatus === 'building') {
@@ -635,7 +715,8 @@ function App() {
             <button className="tree-row" style={{ paddingLeft: 10 + depth * 14 }}
               onClick={() => setExpanded(prev => {
                 const next = new Set(prev)
-                next.has(node.path) ? next.delete(node.path) : next.add(node.path)
+                if (next.has(node.path)) next.delete(node.path)
+                else next.add(node.path)
                 return next
               })}>
               <ChevronRight size={14} className={expanded.has(node.path) ? 'chevron-open' : ''}/>
@@ -759,7 +840,13 @@ function App() {
       {showCreate && <CreateProjectModal onClose={() => setShowCreate(false)} onCreate={createProject}/>}
       {buildOpen && (
         <div className="build-sheet">
-          <div className="build-head"><div><small>BUILD STATUS</small><strong>{buildStatus === 'idle' ? 'Debug APK' : buildStatus}</strong></div><button className="icon-btn" onClick={() => setBuildOpen(false)}><X size={18}/></button></div>
+          <div className="build-head">
+            <div><small>BUILD STATUS</small><strong>{buildStatus === 'idle' ? 'Debug APK' : buildStatus}</strong></div>
+            <div className="build-head-actions">
+              <button className="icon-btn" title="Salin log" aria-label="Salin log" onClick={copyLogs} disabled={logs.length === 0}><Copy size={16}/></button>
+              <button className="icon-btn" title="Tutup" aria-label="Tutup log" onClick={() => setBuildOpen(false)}><X size={18}/></button>
+            </div>
+          </div>
           {buildHistory.length > 1 && <div className="build-history"><label>Riwayat build<select value={buildId ?? ''} onChange={event => {
             const build = buildHistory.find(item => item.id === event.target.value)
             if (build) followBuild(build)

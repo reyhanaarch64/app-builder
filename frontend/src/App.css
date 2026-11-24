@@ -94,8 +94,10 @@ small { color:var(--muted); font-size:10px; font-weight:800; letter-spacing:1.3p
 .login-card .primary-btn { margin-top:16px; }
 .build-sheet { position:fixed; z-index:80; right:12px; top:70px; width:min(430px,calc(100vw - 24px)); max-height:calc(100vh - 82px); display:flex; flex-direction:column; border:1px solid var(--line); border-radius:12px; background:#121820; box-shadow:0 18px 60px rgba(0,0,0,.55); overflow:hidden; }
 .build-head { height:62px; display:flex; align-items:center; justify-content:space-between; padding:10px 12px 10px 16px; border-bottom:1px solid var(--line); }
-.build-head div { display:flex; flex-direction:column; }
+.build-head > div:first-child { display:flex; flex-direction:column; }
 .build-head strong { text-transform:capitalize; margin-top:3px; }
+.build-head-actions { display:flex; align-items:center; gap:4px; }
+.build-head-actions .icon-btn:disabled { opacity:.4; cursor:not-allowed; }
 .status-line { height:44px; display:flex; align-items:center; gap:8px; padding:0 16px; font-size:12px; color:#9eaabc; border-bottom:1px solid var(--line); }
 .status-line span { width:8px; height:8px; border-radius:50%; background:#7b8797; }
 .status-line.building span,.status-line.queued span { background:#e8b66a; box-shadow:0 0 12px #e8b66a; }
