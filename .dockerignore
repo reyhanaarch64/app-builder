@@ -1,0 +1,8 @@
+.git
+.env
+data
+frontend/node_modules
+frontend/coverage
+backend/*.db
+*.apk
+android-ide-server*
