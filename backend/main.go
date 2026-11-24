@@ -702,7 +702,7 @@ func gradleCacheSize() (int64, error) {
 		return 0, nil
 	}
 	out, err := exec.Command("docker", "run", "--rm", "-v", "androidide_gradle:/cache", "--entrypoint", "du",
-		"android-web-ide-builder", "-sb", "/cache").Output()
+		androidBuilderImage(), "-sb", "/cache").Output()
 	if err != nil {
 		return 0, err
 	}
@@ -1203,7 +1203,7 @@ func (s *Server) runBuild(id, workspace string) {
 		fmt.Sprintf("--cpus=%d", s.config.Build.CPUs), "--pids-limit=256",
 		"-v", hostProjectRoot+":/project",
 		"-v", "androidide_gradle:/root/.gradle",
-		"android-web-ide-builder",
+		androidBuilderImage(),
 		"/bin/bash", "-lc", "if [ -x ./gradlew ]; then ./gradlew --no-daemon assembleDebug; elif [ -f ./gradlew ]; then chmod +x ./gradlew && ./gradlew --no-daemon assembleDebug; else gradle --no-daemon assembleDebug; fi")
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
@@ -1262,6 +1262,7 @@ func (s *Server) copyLogs(id, stream string, r io.ReadCloser) {
 				line.WriteString(text[i+1:])
 			}
 		}
+
 		if err != nil {
 			break
 		}
@@ -1270,6 +1271,14 @@ func (s *Server) copyLogs(id, stream string, r io.ReadCloser) {
 		s.addLog(id, stream, text)
 	}
 	r.Close()
+}
+
+func androidBuilderImage() string {
+	image := strings.TrimSpace(os.Getenv("ANDROID_BUILDER_IMAGE"))
+	if image == "" {
+		return "android-web-ide-builder"
+	}
+	return image
 }
 
 func (s *Server) failBuild(id, message string) {

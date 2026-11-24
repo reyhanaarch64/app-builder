@@ -20,21 +20,35 @@ This baseline is intended for one Android build at a time. Builds are serialized
 
 ### Software
 
-- Linux x86-64 host with Docker Engine and Docker Compose.
-- Go 1.24+ and a C compiler for building the API locally (SQLite uses CGO).
+- Linux host with Docker Engine and Docker Compose.
+- Go 1.24+ and a C compiler for the native API executable (SQLite uses CGO).
 - Node.js 20.19+ or 22.12+ with npm to build the frontend.
 - Git.
 - The `android-web-ide-builder` Docker image, which contains JDK 17, Gradle 8.9, Android SDK Platform 34, and Build Tools 34.0.0.
+
+### CPU architectures
+
+The build scripts detect the Linux host architecture and build matching local binaries and Docker images.
+
+| Architecture | Status |
+| --- | --- |
+| `linux/amd64` (Intel/AMD 64-bit) | Supported and tested on the project host. |
+| `linux/arm64` (AArch64) | Build target is included but not verified on ARM64 hardware. Android SDK/Gradle native tools may impose additional limitations. |
+| `linux/386` (x86 32-bit) | Not supported for the full IDE; the Android JDK/SDK builder requires a 64-bit runtime. |
+| `linux/arm/v7` (ARM 32-bit) | Not supported. |
+
+This is Linux-only and requires Docker; Termux without a Linux distribution is not an explicitly supported host.
 
 ## Quick start with Docker Compose
 
 From the repository root:
 
 ```bash
+bash build.sh
 bash start.sh
 ```
 
-`start.sh` creates `data/IDE.config` from the tracked `IDE.config` template if needed, builds the frontend and Android builder image, starts/restarts the web app and API, then waits for its health endpoint. It also supports `bash start.sh stop`, `status`, `logs`, and `restart`.
+`build.sh` detects the host architecture, builds the frontend and a native Go executable in `.build/<architecture>/`, and prepares architecture-tagged Android builder and IDE Docker images. The IDE image is configured to launch the matching builder tag, so building images for another architecture on the same Docker host won't silently mismatch them. `start.sh` creates `data/IDE.config` from the tracked `IDE.config` template if needed, starts/restarts the prebuilt service, and waits for its health endpoint. If the required images do not exist yet, `start.sh` invokes `build.sh` automatically. Run `bash build.sh` again after changing source code or dependencies. `start.sh` also supports `stop`, `status`, `logs`, and `restart`.
 
 The web app and API are served together on the port in `data/IDE.config` (default `8866`). Compose stores the SQLite database, workspaces, APK artifacts, and config in `./data`. `HOST_DATA_DIR` is set by the startup script to the absolute host path needed when Docker mounts a project into an isolated build container.
 
@@ -86,17 +100,15 @@ Open `http://localhost:8866` in a browser. For a remote VPS, place the service b
 
 ## Run the API directly on the host
 
+`build.sh` produces a host-native executable at `.build/<architecture>/android-ide-server` and prepares the frontend and builder image. To run it directly, configure the process with (replace `amd64` with `arm64` on an ARM64 host):
+
 ```bash
-npm --prefix frontend ci
-npm --prefix frontend run build
-docker build -t android-web-ide-builder ./build-image
-cd backend
-go build -o ../android-ide-server .
-cd ..
 DATA_DIR="$(pwd)/data" \
 HOST_DATA_DIR="$(pwd)/data" \
 WEB_DIR="$(pwd)/frontend/dist" \
-IDE_CONFIG="$(pwd)/data/IDE.config" ./android-ide-server
+IDE_CONFIG="$(pwd)/data/IDE.config" \
+ANDROID_BUILDER_IMAGE=android-web-ide-builder:amd64 \
+./.build/amd64/android-ide-server
 ```
 
 `DATA_DIR` is where the API stores its SQLite database, temporary project workspaces, and APK artifacts. `HOST_DATA_DIR` must point to the same directory as seen by the host Docker daemon.

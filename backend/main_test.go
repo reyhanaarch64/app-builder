@@ -15,6 +15,18 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+func TestAndroidBuilderImage(t *testing.T) {
+	t.Setenv("ANDROID_BUILDER_IMAGE", "")
+	if got := androidBuilderImage(); got != "android-web-ide-builder" {
+		t.Fatalf("default builder image = %q, want %q", got, "android-web-ide-builder")
+	}
+
+	t.Setenv("ANDROID_BUILDER_IMAGE", " android-web-ide-builder:arm64 ")
+	if got := androidBuilderImage(); got != "android-web-ide-builder:arm64" {
+		t.Fatalf("configured builder image = %q, want %q", got, "android-web-ide-builder:arm64")
+	}
+}
+
 func TestValidateAndroidProject(t *testing.T) {
 	root := t.TempDir()
 	if err := validateAndroidProject(root); err == nil || !strings.Contains(err.Error(), "settings.gradle") {

@@ -7,3 +7,4 @@ frontend/coverage
 backend/*.db
 *.apk
 android-ide-server*
+.build

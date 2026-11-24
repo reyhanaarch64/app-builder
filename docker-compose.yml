@@ -1,13 +1,12 @@
 services:
   ide:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: app-builder-ide:${IDE_ARCH:?run build.sh for this architecture first}
     ports:
       - "${IDE_PORT:-8866}:${IDE_PORT:-8866}"
     environment:
       DATA_DIR: "/data"
       HOST_DATA_DIR: ${HOST_DATA_DIR:?set HOST_DATA_DIR to an absolute host path}
+      ANDROID_BUILDER_IMAGE: android-web-ide-builder:${IDE_ARCH:?run build.sh for this architecture first}
       WEB_DIR: "/app/frontend/dist"
       IDE_CONFIG: "/data/IDE.config"
     volumes:

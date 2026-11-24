@@ -3,6 +3,9 @@ set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/platform.sh"
+IDE_ARCH="$(detect_linux_arch)"
+export IDE_ARCH
 ACTION="${1:-start}"
 export HOST_DATA_DIR="$ROOT_DIR/data"
 
@@ -37,7 +40,6 @@ case "$ACTION" in
 esac
 
 require_command node
-require_command npm
 
 mkdir -p "$ROOT_DIR/data"
 CONFIG_FILE="$ROOT_DIR/data/IDE.config"
@@ -54,19 +56,20 @@ IDE_PORT="$(node -e '
 ' "$CONFIG_FILE")"
 export IDE_PORT
 
-if [[ ! -d "$ROOT_DIR/frontend/node_modules" ]]; then
-  npm --prefix frontend ci
+if ! docker image inspect "android-web-ide-builder:$IDE_ARCH" >/dev/null 2>&1 ||
+   ! docker image inspect "app-builder-ide:$IDE_ARCH" >/dev/null 2>&1; then
+  printf 'required Docker images are missing; building for linux/%s...\n' "$IDE_ARCH"
+  bash "$ROOT_DIR/build.sh"
 fi
-npm --prefix frontend run build
 
-docker build -t android-web-ide-builder "$ROOT_DIR/build-image"
-docker compose up -d --build --force-recreate ide
+docker compose up -d --force-recreate ide
 
 require_command curl
 for attempt in $(seq 1 60); do
   if curl --silent --fail "http://127.0.0.1:${IDE_PORT}/api/health" >/dev/null; then
     printf 'App Builder is ready at http://localhost:%s\n' "$IDE_PORT"
     printf 'For remote access, open the published HTTPS URL for port %s.\n' "$IDE_PORT"
+    printf 'Run bash build.sh after changing source code or dependencies.\n'
     printf 'To change access mode, edit %s and run: bash start.sh restart\n' "$CONFIG_FILE"
     exit 0
   fi
