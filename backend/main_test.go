@@ -2,8 +2,10 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"database/sql"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -196,6 +198,142 @@ func TestNormalizeManifestRejectsUnsafePathAndBadTextHash(t *testing.T) {
 	mismatched.Files[0].Content = "changed"
 	if _, _, err := normalizeManifest(mismatched); err == nil {
 		t.Fatal("expected text content with a mismatched hash to be rejected")
+	}
+}
+
+func TestNormalizeManifestDefaultsAndValidatesBuildVariant(t *testing.T) {
+	content := "settings"
+	manifest := BuildManifest{
+		ProjectID: "project-1", IdempotencyKey: "request",
+		Files: []ManifestFile{{
+			Path: "settings.gradle.kts", Kind: "text", Size: int64(len(content)),
+			MIMEType: "text/plain", SHA256: hashBytes([]byte(content)), Content: content,
+		}},
+	}
+	normalized, _, err := normalizeManifest(manifest)
+	if err != nil || normalized.Variant != "debug" {
+		t.Fatalf("default variant = %q, err=%v; want debug", normalized.Variant, err)
+	}
+	manifest.Variant = "release"
+	normalized, _, err = normalizeManifest(manifest)
+	if err != nil || normalized.Variant != "release" {
+		t.Fatalf("release variant = %q, err=%v", normalized.Variant, err)
+	}
+	manifest.Variant = "staging"
+	if _, _, err := normalizeManifest(manifest); err == nil {
+		t.Fatal("expected unsupported build variant to be rejected")
+	}
+}
+
+func TestBuildPreparePersistsReleaseVariant(t *testing.T) {
+	db := testDB(t)
+	ownerID := strings.Repeat("a", 64)
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := db.Exec(`INSERT INTO owners(id,created_at,last_seen_at) VALUES(?,?,?)`, ownerID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	content := "rootProject.name = \"release-test\""
+	manifest := BuildManifest{
+		ProjectID: "project-release", IdempotencyKey: "release-request", Variant: "release",
+		Files: []ManifestFile{{
+			Path: "settings.gradle.kts", Kind: "text", Size: int64(len(content)),
+			MIMEType: "text/plain", SHA256: hashBytes([]byte(content)), Content: content,
+		}},
+	}
+	body, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/builds/prepare", bytes.NewReader(body))
+	request.AddCookie(&http.Cookie{Name: "ide_owner", Value: ownerID})
+	response := httptest.NewRecorder()
+	(&Server{db: db}).handleBuildPrepare(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("release prepare returned %d: %s", response.Code, response.Body.String())
+	}
+	var result PrepareResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	var storedVariant string
+	if err := db.QueryRow(`SELECT variant FROM builds WHERE id=?`, result.Build.ID).Scan(&storedVariant); err != nil {
+		t.Fatal(err)
+	}
+	if result.Build.Variant != "release" || storedVariant != "release" {
+		t.Fatalf("release variant response=%q database=%q", result.Build.Variant, storedVariant)
+	}
+}
+
+func TestParseReleaseSigningStoresKeystoreTemporarily(t *testing.T) {
+	server := &Server{dataDir: t.TempDir()}
+	body := &bytes.Buffer{}
+	form := multipart.NewWriter(body)
+	file, err := form.CreateFormFile("keystore", "upload.jks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("test keystore")); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"keyAlias": "release", "storePassword": "store-secret", "keyPassword": "key-secret",
+	} {
+		if err := form.WriteField(name, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := form.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/finalize", body)
+	request.Header.Set("Content-Type", form.FormDataContentType())
+	signing, err := server.parseReleaseSigning(httptest.NewRecorder(), request, "bld_test", "release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signing == nil || signing.keyAlias != "release" {
+		t.Fatalf("unexpected signing options: %+v", signing)
+	}
+	defer server.cleanupReleaseSigning(signing)
+	content, err := os.ReadFile(signing.keyStorePath)
+	if err != nil || string(content) != "test keystore" {
+		t.Fatalf("keystore contents = %q, err=%v", content, err)
+	}
+	for path, want := range map[string]string{
+		signing.storePasswordPath: "store-secret",
+		signing.keyPasswordPath:   "key-secret",
+	} {
+		content, err := os.ReadFile(path)
+		if err != nil || string(content) != want {
+			t.Fatalf("temporary secret contents = %q, err=%v", content, err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0600 {
+			t.Fatalf("temporary secret permissions = %v; want 0600", info.Mode().Perm())
+		}
+	}
+}
+
+func TestFindAPKVariantUsesRequestedBuildType(t *testing.T) {
+	root := t.TempDir()
+	for _, path := range []string{
+		"app/build/outputs/apk/debug/app-debug.apk",
+		"app/build/outputs/apk/release/app-release-unsigned.apk",
+	} {
+		target := filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(target), 0750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, []byte("apk"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	apk, err := findAPKVariant(root, "release")
+	if err != nil || !strings.HasSuffix(apk, "app-release-unsigned.apk") {
+		t.Fatalf("release APK = %q, err=%v", apk, err)
 	}
 }
 

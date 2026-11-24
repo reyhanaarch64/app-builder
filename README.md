@@ -1,8 +1,8 @@
 # App Builder
 
-App Builder is a self-hosted, mobile-friendly Android IDE. Projects are kept in the browser's IndexedDB; a build sends text files in its manifest and only uploads missing binary assets, then builds a debug APK in an isolated Docker container.
+App Builder is a self-hosted, mobile-friendly Android IDE. Projects are kept in the browser's IndexedDB; a build sends text files in its manifest and only uploads missing binary assets, then builds an APK in an isolated Docker container.
 
-The current MVP supports single-module Android projects using Kotlin or Java with XML Views, debug APK builds, ZIP import/export, a Monaco editor, persistent build history, build log streaming, and configurable public/private access. It does not currently support release signing, Compose, NDK, or multi-module projects.
+The current MVP supports single-module Android projects using Kotlin or Java with XML Views, debug and release APK builds, optional release signing, ZIP import/export, a Monaco editor, persistent build history, build log streaming, and configurable public/private access. It does not currently support Compose, NDK, or multi-module projects.
 
 ## Requirements
 
@@ -125,16 +125,19 @@ ANDROID_BUILDER_IMAGE=android-web-ide-builder:amd64 \
 
 1. Create a Kotlin or Java Empty App, or import an Android Studio ZIP.
 2. Edit files in the browser; project files are saved in IndexedDB.
-3. Choose **Build APK**. The browser hashes project files (caching hashes in IndexedDB until file contents change), sends a manifest, and uploads only binary assets missing from this browser's cache.
+3. Choose **Build APK**, then select Debug or Release. The browser hashes project files (caching hashes in IndexedDB until file contents change), sends a manifest, and uploads only binary assets missing from this browser's cache.
 4. The API verifies binary SHA-256 and size, assembles the Android project from text and owner-scoped immutable blobs, then validates the single-module structure.
-5. A Docker container runs Gradle `assembleDebug` with CPU, memory, process, and timeout limits.
+5. A Docker container runs Gradle `assembleDebug` or `assembleRelease` with CPU, memory, process, and timeout limits.
 6. Logs and build status are stored by the API and can be restored after a page refresh or browser restart. Successful APKs are available from the build panel.
+
+Release builds can be signed by uploading a JKS/PKCS12 keystore and entering its alias and passwords. The signing inputs are requested for each build, stored temporarily with owner-only permissions, and removed after the build. Gradle never receives the keystore: APK signing and verification run in a separate network-disabled container. An unsigned release can also be built, but Android won't install it directly.
 
 Each browser project has a stable ID. A second build for that project is rejected while its first build is queued or running; builds are also serialized globally. Once a build reaches a terminal state, that project can be built again.
 
 ## Storage and cleanup
 
 - `DATA_DIR/workspaces/<build-id>` contains temporary upload data and the assembled Gradle workspace while a build is running. New builds remove their workspace when they finish; the cleanup UI can remove leftovers from earlier runs.
+- `DATA_DIR/signing` contains temporary keystore and password files only while a signed release build is running; the worker removes them when it exits.
 - `DATA_DIR/artifacts/<build-id>.apk` contains successful APKs until they are explicitly deleted.
 - `DATA_DIR/blobs/sha256/<owner>/<prefix>/<sha256>` stores immutable binary assets scoped to an opaque per-browser cookie owner. Builds retain blob references while their history exists; deleting history releases refs and garbage-collects unreferenced blobs. Incomplete upload reservations expire after one hour.
 - `DATA_DIR/ide.db` stores build history and logs.
@@ -146,7 +149,7 @@ Open the drive icon in the web UI to inspect storage and choose what to remove. 
 
 In public mode, anyone who can reach the service can submit build jobs, download artifacts, and use cleanup; this is intentional for a public instance. Use private mode when the service is for personal use. Build scripts are untrusted input even though they run in a separate container.
 
-The API container needs access to the Docker socket to start build containers. Access to that socket is highly privileged; only run the service on a host you control. Keep `data/IDE.config` private, use HTTPS when password login is enabled, and protect server-side workspaces and APK artifacts.
+The API container needs access to the Docker socket to start build containers. Access to that socket is highly privileged; only run the service on a host you control. Keep `data/IDE.config` private, use HTTPS for password login and keystore uploads, and protect server-side workspaces and APK artifacts.
 
 ## Development
 

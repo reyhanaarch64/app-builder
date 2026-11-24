@@ -104,6 +104,9 @@ func main() {
 	if err := os.MkdirAll(filepath.Join(dataDir, "blobs"), 0700); err != nil {
 		log.Fatal(err)
 	}
+	if err := os.RemoveAll(filepath.Join(dataDir, "signing")); err != nil {
+		log.Fatal(err)
+	}
 	config, err := loadConfig(configPath)
 	if err != nil {
 		log.Fatal(err)
@@ -939,19 +942,20 @@ func (s *Server) handleBuildCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.addLog(id, "system", "Build job dibuat")
-	s.startBuild(id, workspace)
+	s.startBuild(id, workspace, nil)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(Build{ID: id, ProjectID: projectID, Status: "queued", Variant: "debug", CreatedAt: now})
 }
 
-func (s *Server) startBuild(id, workspace string) {
+func (s *Server) startBuild(id, workspace string, signing *releaseSigning) {
 	if s.startBuildFn != nil {
 		s.startBuildFn(id, workspace)
+		s.cleanupReleaseSigning(signing)
 		return
 	}
-	go s.runBuild(id, workspace)
+	go s.runBuildWithSigning(id, workspace, signing)
 }
 
 var projectIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
@@ -1069,6 +1073,12 @@ func (s *Server) handleBuildRoutes(w http.ResponseWriter, r *http.Request) {
 				if err := os.RemoveAll(filepath.Join(s.dataDir, "workspaces", id)); err != nil {
 					log.Printf("failed to remove canceled build workspace %s: %v", id, err)
 				}
+				signingDir := filepath.Join(s.dataDir, "signing")
+				s.cleanupReleaseSigning(&releaseSigning{
+					keyStorePath:      filepath.Join(signingDir, id+".keystore"),
+					storePasswordPath: filepath.Join(signingDir, id+".storepass"),
+					keyPasswordPath:   filepath.Join(signingDir, id+".keypass"),
+				})
 			}
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -1253,11 +1263,18 @@ func fileExists(path string) bool {
 }
 
 func (s *Server) runBuild(id, workspace string) {
+	s.runBuildWithSigning(id, workspace, nil)
+}
+
+func (s *Server) runBuildWithSigning(id, workspace string, signing *releaseSigning) {
 	defer func() {
 		if err := os.RemoveAll(workspace); err != nil {
 			log.Printf("failed to remove build workspace %s: %v", id, err)
 		}
 	}()
+	if signing != nil {
+		defer s.cleanupReleaseSigning(signing)
+	}
 	s.buildMu.Lock()
 	if s.building[id] {
 		s.buildMu.Unlock()
@@ -1280,6 +1297,15 @@ func (s *Server) runBuild(id, workspace string) {
 		return
 	}
 	hostProjectRoot := filepath.Join(s.hostDataDir, relativeRoot)
+	var variant string
+	if err := s.db.QueryRow(`SELECT variant FROM builds WHERE id=?`, id).Scan(&variant); err != nil {
+		s.failBuild(id, "gagal membaca variant build")
+		return
+	}
+	if variant != "debug" && variant != "release" {
+		s.failBuild(id, "variant build tidak valid")
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.config.Build.TimeoutMinutes)*time.Minute)
 	defer cancel()
 	s.buildMu.Lock()
@@ -1318,6 +1344,15 @@ func (s *Server) runBuild(id, workspace string) {
 		return
 	}
 	s.addLog(id, "system", "Menjalankan Docker build container")
+	outputsDir := filepath.Join(projectRoot, "app", "build", "outputs", "apk")
+	if err := os.RemoveAll(outputsDir); err != nil {
+		s.failBuild(id, "gagal membersihkan output APK sebelumnya")
+		return
+	}
+	gradleTask := "assembleDebug"
+	if variant == "release" {
+		gradleTask = "assembleRelease"
+	}
 	containerName := "android-ide-build-" + id
 	cmd := exec.CommandContext(ctx, "docker", "run", "--rm",
 		"--name", containerName,
@@ -1326,7 +1361,7 @@ func (s *Server) runBuild(id, workspace string) {
 		"-v", hostProjectRoot+":/project",
 		"-v", "androidide_gradle:/root/.gradle",
 		androidBuilderImage(),
-		"/bin/bash", "-lc", "if [ -x ./gradlew ]; then ./gradlew --no-daemon assembleDebug; elif [ -f ./gradlew ]; then chmod +x ./gradlew && ./gradlew --no-daemon assembleDebug; else gradle --no-daemon assembleDebug; fi")
+		"/bin/bash", "-lc", "if [ -x ./gradlew ]; then ./gradlew --no-daemon "+gradleTask+"; elif [ -f ./gradlew ]; then chmod +x ./gradlew && ./gradlew --no-daemon "+gradleTask+"; else gradle --no-daemon "+gradleTask+"; fi")
 	cmd.Cancel = func() error {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer stopCancel()
@@ -1370,10 +1405,26 @@ func (s *Server) runBuild(id, workspace string) {
 		return
 	}
 
-	apk, err := findAPK(projectRoot)
+	apk, err := findAPKVariant(projectRoot, variant)
 	if err != nil {
 		s.failBuild(id, err.Error())
 		return
+	}
+	if signing != nil {
+		apk, err = s.signReleaseAPK(ctx, id, hostProjectRoot, projectRoot, apk, signing)
+		if ctx.Err() == context.Canceled {
+			s.addLog(id, "system", "Build dibatalkan")
+			return
+		}
+		if ctx.Err() == context.DeadlineExceeded {
+			s.failBuild(id, fmt.Sprintf("build timeout %d menit", s.config.Build.TimeoutMinutes))
+			return
+		}
+		if err != nil {
+			s.failBuild(id, "APK release gagal ditandatangani: "+err.Error())
+			return
+		}
+		s.cleanupReleaseSigning(signing)
 	}
 	filename := id + ".apk"
 	artifact := filepath.Join(s.dataDir, "artifacts", filename)
@@ -1381,15 +1432,25 @@ func (s *Server) runBuild(id, workspace string) {
 		s.failBuild(id, "gagal membuat direktori artifact")
 		return
 	}
-	input, _ := os.Open(apk)
+	input, err := os.Open(apk)
+	if err != nil {
+		s.failBuild(id, "gagal membaca APK hasil build")
+		return
+	}
 	output, err := os.Create(artifact)
 	if err != nil {
+		input.Close()
 		s.failBuild(id, "gagal menyimpan APK")
 		return
 	}
-	io.Copy(output, input)
-	input.Close()
-	output.Close()
+	_, copyErr := io.Copy(output, input)
+	inputErr := input.Close()
+	outputErr := output.Close()
+	if copyErr != nil || inputErr != nil || outputErr != nil {
+		os.Remove(artifact)
+		s.failBuild(id, "gagal menyalin APK hasil build")
+		return
+	}
 	if ctx.Err() == context.Canceled {
 		os.Remove(artifact)
 		s.addLog(id, "system", "Build dibatalkan")
@@ -1507,16 +1568,89 @@ func findProjectRoot(workspace string) (string, error) {
 }
 
 func findAPK(root string) (string, error) {
+	return findAPKVariant(root, "debug")
+}
+
+func (s *Server) signReleaseAPK(ctx context.Context, buildID, hostProjectRoot, projectRoot, apk string, signing *releaseSigning) (string, error) {
+	relativeAPK, err := filepath.Rel(projectRoot, apk)
+	if err != nil || relativeAPK == ".." || strings.HasPrefix(relativeAPK, ".."+string(filepath.Separator)) {
+		return "", errors.New("path APK release tidak valid")
+	}
+	for _, path := range []string{signing.keyStorePath, signing.storePasswordPath, signing.keyPasswordPath} {
+		if _, err := os.Stat(path); err != nil {
+			return "", errors.New("file tanda tangan sementara tidak tersedia")
+		}
+	}
+	hostKeystorePath := filepath.Join(s.hostDataDir, "signing", buildID+".keystore")
+	relativeOutput := filepath.Join(filepath.Dir(relativeAPK),
+		strings.TrimSuffix(filepath.Base(relativeAPK), filepath.Ext(relativeAPK))+"-signed.apk")
+	containerAPK := filepath.ToSlash(filepath.Join("/project", relativeAPK))
+	containerOutput := filepath.ToSlash(filepath.Join("/project", relativeOutput))
+	builderImage := androidBuilderImage()
+	apksigner := "/opt/android-sdk/build-tools/34.0.0/apksigner"
+	signCommand := exec.CommandContext(ctx, "docker", "run", "--rm", "--network=none",
+		fmt.Sprintf("--memory=%dm", s.config.Build.MemoryMB),
+		fmt.Sprintf("--cpus=%d", s.config.Build.CPUs), "--pids-limit=256",
+		"-v", hostProjectRoot+":/project",
+		"-v", hostKeystorePath+":/release.keystore:ro",
+		"-v", filepath.Join(s.hostDataDir, "signing", buildID+".storepass")+":/store.pass:ro",
+		"-v", filepath.Join(s.hostDataDir, "signing", buildID+".keypass")+":/key.pass:ro",
+		builderImage, apksigner, "sign",
+		"--ks", "/release.keystore", "--ks-key-alias", signing.keyAlias,
+		"--ks-pass", "file:/store.pass",
+		"--key-pass", "file:/key.pass",
+		"--out", containerOutput, containerAPK)
+	output, err := signCommand.CombinedOutput()
+	if text := strings.TrimSpace(string(output)); text != "" {
+		s.addLog(buildID, "stdout", text)
+	}
+	if err != nil {
+		return "", fmt.Errorf("apksigner gagal: %w", err)
+	}
+
+	verifyCommand := exec.CommandContext(ctx, "docker", "run", "--rm", "--network=none",
+		"-v", hostProjectRoot+":/project:ro",
+		builderImage, apksigner, "verify", containerOutput)
+	output, err = verifyCommand.CombinedOutput()
+	if text := strings.TrimSpace(string(output)); text != "" {
+		s.addLog(buildID, "stdout", text)
+	}
+	if err != nil {
+		return "", fmt.Errorf("verifikasi signature APK gagal: %w", err)
+	}
+	return filepath.Join(projectRoot, relativeOutput), nil
+}
+
+func findAPKVariant(root, variant string) (string, error) {
+	outputsDir := filepath.Join(root, "app", "build", "outputs", "apk")
 	var apk string
-	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err == nil && info != nil && !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".apk") &&
-			strings.Contains(filepath.ToSlash(path), "/build/outputs/apk/") {
-			apk = path
+	err := filepath.Walk(outputsDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info == nil || info.IsDir() || !strings.EqualFold(filepath.Ext(info.Name()), ".apk") {
+			return nil
+		}
+		relative, err := filepath.Rel(outputsDir, filepath.Dir(path))
+		if err != nil {
+			return err
+		}
+		for _, segment := range strings.Split(filepath.ToSlash(relative), "/") {
+			if segment == variant {
+				if apk != "" {
+					return fmt.Errorf("lebih dari satu APK %s ditemukan; project dengan product flavor belum didukung", variant)
+				}
+				apk = path
+				break
+			}
 		}
 		return nil
 	})
+	if err != nil {
+		return "", err
+	}
 	if apk == "" {
-		return "", fmt.Errorf("APK tidak ditemukan setelah Gradle build")
+		return "", fmt.Errorf("APK %s tidak ditemukan setelah Gradle build", variant)
 	}
 	return apk, nil
 }

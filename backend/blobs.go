@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 const reservationTTL = time.Hour
 const maxProjectBytes = 250 << 20
 const maxManifestBytes = 50 << 20
+const maxKeystoreBytes = 32 << 20
 
 var sha256Pattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 var idempotencyPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
@@ -37,6 +39,7 @@ type ManifestFile struct {
 type BuildManifest struct {
 	ProjectID      string         `json:"projectId"`
 	IdempotencyKey string         `json:"idempotencyKey"`
+	Variant        string         `json:"variant,omitempty"`
 	Files          []ManifestFile `json:"files"`
 }
 
@@ -151,8 +154,8 @@ func (s *Server) handleBuildPrepare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, err = tx.Exec(`INSERT INTO builds(id,project_id,owner_id,idempotency_key,manifest_hash,status,variant,created_at,updated_at)
-		VALUES(?,?,?,?,?,'preparing','debug',?,?)`,
-		id, normalized.ProjectID, ownerID, normalized.IdempotencyKey, manifestHash, createdAt, createdAt)
+		VALUES(?,?,?,?,?,'preparing',?,?,?)`,
+		id, normalized.ProjectID, ownerID, normalized.IdempotencyKey, manifestHash, normalized.Variant, createdAt, createdAt)
 	if err == nil {
 		_, err = tx.Exec(`INSERT INTO build_manifests(build_id,manifest,expires_at) VALUES(?,?,?)`,
 			id, string(manifestJSON), now.Add(reservationTTL).Format(time.RFC3339))
@@ -179,7 +182,7 @@ func (s *Server) handleBuildPrepare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, PrepareResponse{
-		Build:        Build{ID: id, ProjectID: normalized.ProjectID, Status: "preparing", Variant: "debug", CreatedAt: createdAt},
+		Build:        Build{ID: id, ProjectID: normalized.ProjectID, Status: "preparing", Variant: normalized.Variant, CreatedAt: createdAt},
 		MissingBlobs: missing,
 	})
 }
@@ -203,6 +206,12 @@ func insertBlobReservations(tx *sql.Tx, buildID, ownerID string, manifest BuildM
 func normalizeManifest(manifest BuildManifest) (BuildManifest, int64, error) {
 	if !validProjectID(manifest.ProjectID) || !idempotencyPattern.MatchString(manifest.IdempotencyKey) {
 		return manifest, 0, errors.New("projectId atau idempotencyKey tidak valid")
+	}
+	if manifest.Variant == "" {
+		manifest.Variant = "debug"
+	}
+	if manifest.Variant != "debug" && manifest.Variant != "release" {
+		return manifest, 0, errors.New("variant build harus debug atau release")
 	}
 	if len(manifest.Files) == 0 || len(manifest.Files) > 20000 {
 		return manifest, 0, errors.New("manifest harus berisi 1 sampai 20.000 file")
@@ -423,9 +432,10 @@ func (s *Server) handleBuildFinalize(w http.ResponseWriter, r *http.Request, own
 	}
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
-	var expiresAt string
-	if err := s.db.QueryRow(`SELECT m.expires_at FROM build_manifests m
-		JOIN builds b ON b.id=m.build_id WHERE m.build_id=? AND b.owner_id=?`, buildID, ownerID).Scan(&expiresAt); err != nil {
+	var expiresAt, variant, status string
+	if err := s.db.QueryRow(`SELECT m.expires_at,b.variant,b.status FROM build_manifests m
+		JOIN builds b ON b.id=m.build_id WHERE m.build_id=? AND b.owner_id=?`, buildID, ownerID).
+		Scan(&expiresAt, &variant, &status); err != nil {
 		if build, buildErr := s.getBuildForOwner(ownerID, buildID); buildErr == nil &&
 			(build.Status == "queued" || build.Status == "building" || build.Status == "success" ||
 				build.Status == "failed" || build.Status == "canceled") {
@@ -435,10 +445,38 @@ func (s *Server) handleBuildFinalize(w http.ResponseWriter, r *http.Request, own
 		http.NotFound(w, r)
 		return
 	}
+	if status != "preparing" {
+		if build, err := s.getBuildForOwner(ownerID, buildID); err == nil &&
+			(build.Status == "queued" || build.Status == "building" || build.Status == "success" ||
+				build.Status == "failed" || build.Status == "canceled") {
+			writeJSON(w, http.StatusOK, build)
+			return
+		}
+		http.Error(w, "reservasi build tidak ditemukan atau sudah dipakai", http.StatusConflict)
+		return
+	}
 	expiry, err := time.Parse(time.RFC3339, expiresAt)
 	if err != nil || time.Now().After(expiry) {
 		http.Error(w, "reservasi build sudah kedaluwarsa", http.StatusConflict)
 		return
+	}
+	signing, err := s.parseReleaseSigning(w, r, buildID, variant)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "file keystore melebihi batas 32 MB", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+		return
+	}
+	signingTransferred := false
+	if signing != nil {
+		defer func() {
+			if !signingTransferred {
+				s.cleanupReleaseSigning(signing)
+			}
+		}()
 	}
 	var projectID, manifestJSON string
 	result, err := s.db.Exec(`UPDATE builds SET status='assembling',updated_at=?
@@ -534,13 +572,129 @@ func (s *Server) handleBuildFinalize(w http.ResponseWriter, r *http.Request, own
 		return
 	}
 	s.addLog(buildID, "system", "Project dirakit dari manifest dan binary cache")
-	s.startBuild(buildID, workspace)
+	s.startBuild(buildID, workspace, signing)
+	signingTransferred = signing != nil
 	build, err := s.getBuild(buildID)
 	if err != nil {
 		http.Error(w, "build dibuat tetapi gagal membaca status", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, http.StatusCreated, build)
+}
+
+type releaseSigning struct {
+	keyStorePath      string
+	storePasswordPath string
+	keyPasswordPath   string
+	keyAlias          string
+}
+
+func (s *Server) parseReleaseSigning(w http.ResponseWriter, r *http.Request, buildID, variant string) (*releaseSigning, error) {
+	if variant != "release" {
+		if r.ContentLength != 0 {
+			return nil, errors.New("opsi tanda tangan hanya berlaku untuk build release")
+		}
+		return nil, nil
+	}
+	if r.ContentLength == 0 {
+		return nil, nil
+	}
+	if !strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		return nil, errors.New("data tanda tangan harus berupa multipart/form-data")
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxKeystoreBytes+(1<<20))
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		return nil, err
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	} else {
+		return nil, errors.New("form data keystore tidak valid")
+	}
+	files := r.MultipartForm.File["keystore"]
+	keyAlias := strings.TrimSpace(r.FormValue("keyAlias"))
+	storePassword := r.FormValue("storePassword")
+	keyPassword := r.FormValue("keyPassword")
+	hasSigningData := len(files) > 0 || keyAlias != "" || storePassword != "" || keyPassword != ""
+	if !hasSigningData {
+		return nil, nil
+	}
+	if len(files) != 1 || keyAlias == "" || storePassword == "" || keyPassword == "" {
+		return nil, errors.New("keystore, alias, store password, dan key password wajib diisi")
+	}
+	if files[0].Size <= 0 || files[0].Size > maxKeystoreBytes {
+		return nil, errors.New("ukuran keystore harus antara 1 byte dan 32 MB")
+	}
+	if len(keyAlias) > 256 || len(storePassword) > 4096 || len(keyPassword) > 4096 ||
+		strings.ContainsAny(keyAlias+storePassword+keyPassword, "\x00\r\n") {
+		return nil, errors.New("alias atau password keystore tidak valid")
+	}
+
+	signingDir := filepath.Join(s.dataDir, "signing")
+	if err := os.MkdirAll(signingDir, 0700); err != nil {
+		return nil, fmt.Errorf("gagal menyiapkan file keystore")
+	}
+	if err := os.Chmod(signingDir, 0700); err != nil {
+		return nil, errors.New("gagal mengamankan direktori keystore")
+	}
+	temp, err := os.CreateTemp(signingDir, "keystore-upload-*")
+	if err != nil {
+		return nil, errors.New("gagal menyiapkan file keystore")
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	file, err := files[0].Open()
+	if err != nil {
+		temp.Close()
+		return nil, errors.New("gagal membaca file keystore")
+	}
+	written, copyErr := io.Copy(temp, io.LimitReader(file, maxKeystoreBytes+1))
+	file.Close()
+	closeErr := temp.Close()
+	if copyErr != nil || closeErr != nil || written != files[0].Size || written > maxKeystoreBytes {
+		return nil, errors.New("gagal menerima file keystore")
+	}
+
+	keyStorePath := filepath.Join(signingDir, buildID+".keystore")
+	if err := os.Rename(tempPath, keyStorePath); err != nil {
+		return nil, errors.New("gagal menyimpan file keystore sementara")
+	}
+	storePasswordPath := filepath.Join(signingDir, buildID+".storepass")
+	keyPasswordPath := filepath.Join(signingDir, buildID+".keypass")
+	if err := writeSigningSecret(storePasswordPath, storePassword); err != nil {
+		os.Remove(keyStorePath)
+		os.Remove(storePasswordPath)
+		return nil, errors.New("gagal menyimpan password keystore sementara")
+	}
+	if err := writeSigningSecret(keyPasswordPath, keyPassword); err != nil {
+		os.Remove(keyStorePath)
+		os.Remove(storePasswordPath)
+		os.Remove(keyPasswordPath)
+		return nil, errors.New("gagal menyimpan password keystore sementara")
+	}
+	return &releaseSigning{
+		keyStorePath: keyStorePath, storePasswordPath: storePasswordPath,
+		keyPasswordPath: keyPasswordPath, keyAlias: keyAlias,
+	}, nil
+}
+
+func writeSigningSecret(path, value string) error {
+	if err := os.WriteFile(path, []byte(value), 0600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
+}
+
+func (s *Server) cleanupReleaseSigning(signing *releaseSigning) {
+	if signing == nil {
+		return
+	}
+	for _, path := range []string{signing.keyStorePath, signing.storePasswordPath, signing.keyPasswordPath} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("failed to remove temporary signing file: %v", err)
+		}
+	}
 }
 
 func (s *Server) commitBuildBlobRefs(buildID, ownerID string, manifest BuildManifest) error {

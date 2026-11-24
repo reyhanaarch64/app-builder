@@ -73,6 +73,14 @@ small { color:var(--muted); font-size:10px; font-weight:800; letter-spacing:1.3p
 .form-row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
 .full { width:100%; margin-top:16px; }
 .primary-btn:disabled { opacity:.45; cursor:not-allowed; }
+.build-options-modal { max-height:calc(100vh - 32px); overflow:auto; }
+.build-options-modal input[type=file] { height:auto; padding:9px; }
+.build-sign-toggle { flex-direction:row !important; align-items:center; gap:9px !important; cursor:pointer; }
+.build-sign-toggle input { flex:none; width:16px; height:16px; margin:0; padding:0; accent-color:var(--accent); }
+.build-sign-toggle span { color:#dce5ef; font-size:12px; }
+.build-signing-note { margin:10px 0; border:1px solid #286953; border-radius:8px; background:#101a18; color:#9ce3c8; padding:9px 10px; font-size:11px; line-height:1.45; }
+.build-signing-note.unsigned { border-color:#785d31; background:#1b1710; color:#e7c68e; }
+.build-signing-error { margin-top:10px; border:1px solid #773c43; border-radius:7px; background:#351f24; color:#ffc6cb; padding:8px 10px; font-size:12px; }
 .storage-modal { width:min(560px,100%); max-height:calc(100vh - 32px); overflow:auto; }
 .artifact-modal { width:min(680px,100%); max-height:calc(100vh - 32px); display:flex; flex-direction:column; }
 .artifact-head-actions,.artifact-actions { display:flex; align-items:center; gap:4px; }

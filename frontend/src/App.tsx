@@ -38,10 +38,18 @@ type Build = {
   id: string
   projectId: string
   status: 'preparing' | 'assembling' | 'queued' | 'building' | 'success' | 'failed' | 'canceled'
-  variant: string
+  variant: 'debug' | 'release'
   createdAt: string
   error?: string
   artifact?: string
+}
+
+type BuildOptions = {
+  variant: Build['variant']
+  keystore?: File
+  keyAlias?: string
+  storePassword?: string
+  keyPassword?: string
 }
 
 type APKArtifact = {
@@ -315,7 +323,9 @@ function App() {
   const [editorStateProjectId, setEditorStateProjectId] = useState<string | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [buildOpen, setBuildOpen] = useState(false)
+  const [buildOptionsOpen, setBuildOptionsOpen] = useState(false)
   const [buildStatus, setBuildStatus] = useState<Build['status'] | 'idle'>('idle')
+  const [buildVariant, setBuildVariant] = useState<Build['variant']>('debug')
   const [buildCanceling, setBuildCanceling] = useState(false)
   const [logs, setLogs] = useState<string[]>([])
   const [buildId, setBuildId] = useState<string | null>(null)
@@ -880,6 +890,7 @@ function App() {
   function followBuild(build: Build) {
     buildEvents.current?.close()
     setBuildId(build.id)
+    setBuildVariant(build.variant)
     setBuildStatus(build.status)
     setLogs([])
     setBuildOpen(true)
@@ -960,7 +971,7 @@ function App() {
     }
   }
 
-  async function startBuild() {
+  function openBuildOptions() {
     if (!onlineAccess) {
       setToast('Build APK butuh koneksi ke server')
       return
@@ -971,7 +982,12 @@ function App() {
       setBuildOpen(true)
       return
     }
+    setBuildOptionsOpen(true)
+  }
 
+  async function startBuild(options: BuildOptions) {
+    setBuildOptionsOpen(false)
+    if (!onlineAccess || !activeProject) return
     const buildFiles = await ensureGeneratedJvmTargets(activeProject, files)
     if (buildFiles !== files) setFiles(buildFiles)
     const invalidReason = validateBuildProject(activeProject, buildFiles)
@@ -982,6 +998,7 @@ function App() {
     setBuildOpen(true)
     setBuildId(null)
     setBuildCanceling(false)
+    setBuildVariant(options.variant)
     buildPrepareInFlight.current = false
     buildCancelRequested.current = false
     pendingBuildId.current = null
@@ -1003,6 +1020,7 @@ function App() {
         body: JSON.stringify({
           projectId: activeProject.id,
           idempotencyKey: crypto.randomUUID(),
+          variant: options.variant,
           files: manifestFiles,
         }),
       })
@@ -1065,10 +1083,19 @@ function App() {
       setBuildStatus('assembling')
       setLogs(prev => [...prev, 'Binary lengkap, merakit workspace build...'])
       finalizeStarted = true
-      const finalizeResponse = await fetch(`/api/builds/${buildReservation.id}/finalize`, {
+      const finalizeRequest: RequestInit = {
         method: 'POST',
         signal: controller.signal,
-      })
+      }
+      if (options.keystore) {
+        const formData = new FormData()
+        formData.append('keystore', options.keystore)
+        formData.append('keyAlias', options.keyAlias ?? '')
+        formData.append('storePassword', options.storePassword ?? '')
+        formData.append('keyPassword', options.keyPassword ?? '')
+        finalizeRequest.body = formData
+      }
+      const finalizeResponse = await fetch(`/api/builds/${buildReservation.id}/finalize`, finalizeRequest)
       const finalizeBody = await finalizeResponse.text()
       let build: Build
       try { build = JSON.parse(finalizeBody) as Build }
@@ -1208,7 +1235,7 @@ function App() {
         {activeProject && <div className="project-title">{activeProject.name}</div>}
         {!onlineAccess && <div className="offline-indicator"><WifiOff size={14}/><span>offline · edit lokal</span></div>}
         {!isInstalled && <button className="install-btn" title="Install Android Web IDE" onClick={() => void installApp()}><Smartphone size={16}/><span>Install</span></button>}
-        <button className="build-btn" onClick={startBuild} disabled={!onlineAccess || !activeProject || buildCanceling || buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building'} title={!onlineAccess ? 'Build APK butuh koneksi ke server' : undefined}>
+        <button className="build-btn" onClick={openBuildOptions} disabled={!onlineAccess || !activeProject || buildCanceling || buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building'} title={!onlineAccess ? 'Build APK butuh koneksi ke server' : undefined}>
           <Play size={16} fill="currentColor"/><span>{!onlineAccess ? 'Offline' : buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building' ? 'Building...' : 'Build APK'}</span>
         </button>
         <button className="icon-btn" title={onlineAccess ? 'APK tersimpan' : 'Perlu koneksi ke server'} onClick={openArtifacts} disabled={!onlineAccess}><Archive size={18}/></button>
@@ -1297,10 +1324,14 @@ function App() {
       </main>
 
       {showCreate && <CreateProjectModal onClose={() => setShowCreate(false)} onCreate={createProject}/>}
+      {buildOptionsOpen && <BuildOptionsDialog
+        onClose={() => setBuildOptionsOpen(false)}
+        onStart={options => void startBuild(options)}
+      />}
       {buildOpen && (
         <div className="build-sheet">
           <div className="build-head">
-            <div><small>BUILD STATUS</small><strong>{buildStatus === 'idle' ? 'Debug APK' : buildStatus}</strong></div>
+            <div><small>BUILD STATUS</small><strong>{buildStatus === 'idle' ? `${buildVariant} APK` : `${buildVariant} · ${buildStatus}`}</strong></div>
             <div className="build-head-actions">
               {(buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building') &&
                 <button className="icon-btn cancel-build-btn" title={buildCanceling ? 'Membatalkan build' : 'Batalkan build'}
@@ -1314,7 +1345,7 @@ function App() {
           {buildHistory.length > 1 && <div className="build-history"><label>Riwayat build<select value={buildId ?? ''} onChange={event => {
             const build = buildHistory.find(item => item.id === event.target.value)
             if (build) followBuild(build)
-          }}>{buildHistory.map(build => <option key={build.id} value={build.id}>{build.status} · {new Date(build.createdAt).toLocaleString()}</option>)}</select></label></div>}
+          }}>{buildHistory.map(build => <option key={build.id} value={build.id}>{build.variant} · {build.status} · {new Date(build.createdAt).toLocaleString()}</option>)}</select></label></div>}
           <div className={`status-line ${buildStatus}`}><span></span>{buildStatus === 'preparing' ? 'Menyiapkan manifest dan binary...' : buildStatus === 'assembling' ? 'Merakit workspace...' : buildStatus === 'building' ? 'Building...' : buildStatus === 'success' ? 'Build berhasil' : buildStatus === 'failed' ? 'Build gagal' : buildStatus === 'canceled' ? 'Build dibatalkan' : 'Menunggu worker'}</div>
           <div className="log-view">{logs.map((line, i) => <div key={i}><span>{String(i + 1).padStart(3, '0')}</span>{line}</div>)}</div>
           {buildStatus === 'success' && buildId && buildHistory.find(build => build.id === buildId)?.artifact &&
@@ -1356,6 +1387,87 @@ function App() {
         />
       )}
       {toast && <div className="toast">{toast}</div>}
+    </div>
+  )
+}
+
+function BuildOptionsDialog({ onStart, onClose }: {
+  onStart: (options: BuildOptions) => void
+  onClose: () => void
+}) {
+  const [variant, setVariant] = useState<Build['variant']>('debug')
+  const [signRelease, setSignRelease] = useState(true)
+  const [keystore, setKeystore] = useState<File | null>(null)
+  const [keyAlias, setKeyAlias] = useState('')
+  const [storePassword, setStorePassword] = useState('')
+  const [keyPassword, setKeyPassword] = useState('')
+  const [error, setError] = useState('')
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setError('')
+    if (variant === 'release' && signRelease) {
+      if (!keystore || !keyAlias.trim() || !storePassword || !keyPassword) {
+        setError('Pilih keystore dan isi alias serta kedua password')
+        return
+      }
+      onStart({ variant, keystore, keyAlias: keyAlias.trim(), storePassword, keyPassword })
+      return
+    }
+    onStart({ variant })
+  }
+
+  return (
+    <div className="modal-backdrop">
+      <section className="modal build-options-modal">
+        <div className="modal-head">
+          <div><small>BUILD APK</small><h2>Pengaturan build</h2></div>
+          <button className="icon-btn" title="Tutup" onClick={onClose}><X size={18}/></button>
+        </div>
+        <form onSubmit={submit}>
+          <label>Variant
+            <select value={variant} onChange={event => setVariant(event.target.value as Build['variant'])}>
+              <option value="debug">Debug · untuk testing</option>
+              <option value="release">Release · untuk distribusi</option>
+            </select>
+          </label>
+          {variant === 'release' && (
+            <>
+              <label className="build-sign-toggle">
+                <input type="checkbox" checked={signRelease} onChange={event => setSignRelease(event.target.checked)}/>
+                <span>Tandatangani APK dengan keystore</span>
+              </label>
+              {signRelease ? (
+                <>
+                  <p className="build-signing-note">Keystore dan password hanya dipakai untuk build ini, lalu file keystore dihapus dari server.</p>
+                  <label>File keystore (.jks, .keystore, .p12)
+                    <input type="file" accept=".jks,.keystore,.p12,.pfx" onChange={event => {
+                      const file = event.currentTarget.files?.[0] ?? null
+                      if (file && file.size > 32 * 1024 * 1024) {
+                        setKeystore(null)
+                        setError('Ukuran keystore maksimal 32 MB')
+                        event.currentTarget.value = ''
+                        return
+                      }
+                      setError('')
+                      setKeystore(file)
+                    }}/>
+                  </label>
+                  <label>Key alias<input value={keyAlias} onChange={event => setKeyAlias(event.target.value)} autoComplete="off" required/></label>
+                  <div className="form-row">
+                    <label>Store password<input type="password" value={storePassword} onChange={event => setStorePassword(event.target.value)} autoComplete="new-password" required/></label>
+                    <label>Key password<input type="password" value={keyPassword} onChange={event => setKeyPassword(event.target.value)} autoComplete="new-password" required/></label>
+                  </div>
+                </>
+              ) : (
+                <p className="build-signing-note unsigned">Release tanpa signature nggak bisa dipasang langsung di Android.</p>
+              )}
+            </>
+          )}
+          {error && <div className="build-signing-error">{error}</div>}
+          <button className="primary-btn full" type="submit">Build {variant} APK</button>
+        </form>
+      </section>
     </div>
   )
 }
