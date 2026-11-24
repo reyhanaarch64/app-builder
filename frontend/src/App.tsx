@@ -253,6 +253,16 @@ function throwIfBuildAborted(signal: AbortSignal) {
   throw error
 }
 
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timeoutId: number | undefined
+  const timeout = new Promise<T>((_, reject) => {
+    timeoutId = window.setTimeout(() => reject(new Error(message)), timeoutMs)
+  })
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timeoutId !== undefined) window.clearTimeout(timeoutId)
+  })
+}
+
 async function createBuildManifest(files: ProjectFile[], signal: AbortSignal): Promise<ManifestFile[]> {
   const encoder = new TextEncoder()
   const manifest: ManifestFile[] = []
@@ -348,6 +358,8 @@ function App() {
   const [notificationError, setNotificationError] = useState('')
   const [pushSubscribed, setPushSubscribed] = useState(false)
   const [pushPermission, setPushPermission] = useState<NotificationPermission>('default')
+  const [pushServiceWorkerReady, setPushServiceWorkerReady] = useState(false)
+  const [pushStage, setPushStage] = useState<'idle' | 'permission' | 'key' | 'worker' | 'subscribe' | 'saving'>('idle')
   const [pushBusy, setPushBusy] = useState(false)
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null)
   const [loginPassword, setLoginPassword] = useState('')
@@ -1134,26 +1146,33 @@ function App() {
       const pushStatus = await pushResponse.json() as PushSubscriptionStatus & { error?: string }
       if (!pushResponse.ok) throw new Error(pushStatus.error || 'gagal membaca status browser notification')
       setNotificationSettings(settings)
-      const supported = 'Notification' in window && 'PushManager' in window && 'serviceWorker' in navigator
+      const supported = window.isSecureContext &&
+        'Notification' in window && 'PushManager' in window && 'serviceWorker' in navigator
       setPushPermission(supported ? Notification.permission : 'denied')
+      setPushServiceWorkerReady(false)
       if (supported) {
-        const registration = await navigator.serviceWorker.ready
-        let subscription = await registration.pushManager.getSubscription()
-        if (subscription && !pushStatus.subscribed) {
-          const saveResponse = await fetch('/api/notifications/push/subscription', {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(subscription.toJSON()),
-          })
-          if (!saveResponse.ok) throw new Error('gagal menyimpan browser notification')
-        } else if (!subscription && pushStatus.subscribed) {
-          await fetch('/api/notifications/push/subscription', {
-            method: 'DELETE',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ endpoint: '' }),
-          })
+        const registration = await navigator.serviceWorker.getRegistration()
+        if (registration?.active) {
+          setPushServiceWorkerReady(true)
+          const subscription = await registration.pushManager.getSubscription()
+          if (subscription && !pushStatus.subscribed) {
+            const saveResponse = await fetch('/api/notifications/push/subscription', {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(subscription.toJSON()),
+            })
+            if (!saveResponse.ok) throw new Error('gagal menyimpan browser notification')
+          } else if (!subscription && pushStatus.subscribed) {
+            await fetch('/api/notifications/push/subscription', {
+              method: 'DELETE',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ endpoint: '' }),
+            })
+          }
+          setPushSubscribed(Boolean(subscription))
+        } else {
+          setPushSubscribed(false)
         }
-        setPushSubscribed(Boolean(subscription))
       } else {
         setPushSubscribed(false)
       }
@@ -1165,6 +1184,10 @@ function App() {
   }
 
   async function enablePushNotifications() {
+    if (!window.isSecureContext) {
+      setNotificationError('browser push butuh HTTPS; buka IDE lewat alamat HTTPS yang valid')
+      return
+    }
     if (!('Notification' in window) || !('PushManager' in window) || !('serviceWorker' in navigator)) {
       setNotificationError('browser ini belum mendukung browser push notification')
       return
@@ -1172,23 +1195,55 @@ function App() {
     setPushBusy(true)
     setNotificationError('')
     try {
+      setPushStage('permission')
       const permission = Notification.permission === 'default'
-        ? await Notification.requestPermission()
+        ? await withTimeout(
+          Promise.resolve(Notification.requestPermission()),
+          30000,
+          'permintaan izin notifikasi belum dijawab dalam 30 detik',
+        )
         : Notification.permission
       setPushPermission(permission)
       if (permission !== 'granted') throw new Error('izin notifikasi browser tidak diberikan')
-      const keyResponse = await fetch('/api/notifications/push/key')
+      setPushStage('key')
+      const keyResponse = await fetch('/api/notifications/push/key', { signal: AbortSignal.timeout(15000) })
       const keyData = await keyResponse.json() as { publicKey?: string; error?: string }
       if (!keyResponse.ok || !keyData.publicKey) throw new Error(keyData.error || 'gagal mengambil kunci browser notification')
-      const registration = await navigator.serviceWorker.ready
-      const subscription = await registration.pushManager.getSubscription() ??
-        await registration.pushManager.subscribe({
+      setPushStage('worker')
+      const currentRegistration = await navigator.serviceWorker.getRegistration()
+      const registration = currentRegistration?.active
+        ? currentRegistration
+        : await withTimeout(
+          navigator.serviceWorker.ready,
+          15000,
+          'service worker belum aktif setelah 15 detik; refresh halaman lalu coba lagi',
+        )
+      setPushServiceWorkerReady(true)
+      setPushStage('subscribe')
+      let subscription = await registration.pushManager.getSubscription()
+      if (!subscription) {
+        const subscribePromise = registration.pushManager.subscribe({
           userVisibleOnly: true,
           applicationServerKey: decodeVapidPublicKey(keyData.publicKey),
         })
+        try {
+          subscription = await withTimeout(
+            subscribePromise,
+            30000,
+            'Chrome belum menyelesaikan pendaftaran push dalam 30 detik',
+          )
+        } catch (error) {
+          if (error instanceof Error && error.message === 'Chrome belum menyelesaikan pendaftaran push dalam 30 detik') {
+            void subscribePromise.then(lateSubscription => lateSubscription.unsubscribe()).catch(() => undefined)
+          }
+          throw error
+        }
+      }
+      setPushStage('saving')
       const response = await fetch('/api/notifications/push/subscription', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(15000),
         body: JSON.stringify(subscription.toJSON()),
       })
       const data = await response.json() as { error?: string }
@@ -1201,6 +1256,7 @@ function App() {
     } catch (error) {
       setNotificationError(error instanceof Error ? error.message : 'gagal mengaktifkan browser notification')
     } finally {
+      setPushStage('idle')
       setPushBusy(false)
     }
   }
@@ -1209,7 +1265,8 @@ function App() {
     setPushBusy(true)
     setNotificationError('')
     try {
-      const registration = await navigator.serviceWorker.ready
+      const registration = await navigator.serviceWorker.getRegistration()
+      if (!registration?.active) throw new Error('service worker belum aktif; refresh halaman lalu coba lagi')
       const subscription = await registration.pushManager.getSubscription()
       const response = await fetch('/api/notifications/push/subscription', {
         method: 'DELETE',
@@ -1491,9 +1548,11 @@ function App() {
           saving={notificationSaving}
           testing={notificationTesting}
           pushBusy={pushBusy}
-          pushSupported={'Notification' in window && 'PushManager' in window && 'serviceWorker' in navigator}
+          pushSupported={window.isSecureContext && 'Notification' in window && 'PushManager' in window && 'serviceWorker' in navigator}
           pushSubscribed={pushSubscribed}
           pushPermission={pushPermission}
+          pushServiceWorkerReady={pushServiceWorkerReady}
+          pushStage={pushStage}
           error={notificationError}
           onSettingsChange={setNotificationSettings}
           onSave={saveNotificationSettings}
@@ -1509,7 +1568,7 @@ function App() {
 }
 
 function NotificationDialog({ settings, loading, saving, testing, pushBusy, pushSupported, pushSubscribed,
-  pushPermission, error, onSettingsChange, onSave, onTest, onPushToggle, onPushTest, onClose }: {
+  pushPermission, pushServiceWorkerReady, pushStage, error, onSettingsChange, onSave, onTest, onPushToggle, onPushTest, onClose }: {
   settings: NotificationSettings | null
   loading: boolean
   saving: boolean
@@ -1518,6 +1577,8 @@ function NotificationDialog({ settings, loading, saving, testing, pushBusy, push
   pushSupported: boolean
   pushSubscribed: boolean
   pushPermission: NotificationPermission
+  pushServiceWorkerReady: boolean
+  pushStage: 'idle' | 'permission' | 'key' | 'worker' | 'subscribe' | 'saving'
   error: string
   onSettingsChange: (settings: NotificationSettings | null) => void
   onSave: (event: FormEvent<HTMLFormElement>) => void
@@ -1556,17 +1617,25 @@ function NotificationDialog({ settings, loading, saving, testing, pushBusy, push
             </div>
             <section className="push-settings">
               <div><strong>Browser push</strong>
-                <small>{!pushSupported
+                <small>{!window.isSecureContext
+                  ? 'browser push butuh HTTPS dan sertifikat yang valid'
+                  : !pushSupported
                   ? 'browser ini belum mendukung push notification'
                   : pushPermission === 'denied'
                     ? 'izin notifikasi diblokir di pengaturan browser'
-                    : pushSubscribed ? 'browser ini siap menerima notifikasi build'
-                      : 'notifikasi bisa diterima saat IDE tidak sedang dibuka'}</small>
+                    : !pushServiceWorkerReady
+                      ? 'service worker belum aktif; tombol aktifkan akan mencoba lagi'
+                      : pushSubscribed ? 'browser ini siap menerima notifikasi build'
+                        : 'notifikasi bisa diterima saat IDE tidak sedang dibuka'}</small>
               </div>
               <div className="push-actions">
                 <button type="button" className="tool-btn refresh-storage" onClick={onPushToggle}
                   disabled={busy || !pushSupported || pushPermission === 'denied'}>
-                  {pushBusy ? 'memproses…' : pushSubscribed ? 'nonaktifkan' : 'aktifkan'}
+                  {pushBusy
+                    ? pushStage === 'idle' ? 'memproses…'
+                      : ({ permission: 'minta izin…', key: 'ambil key…', worker: 'menunggu worker…',
+                        subscribe: 'daftar push…', saving: 'menyimpan…' }[pushStage])
+                    : pushSubscribed ? 'nonaktifkan' : 'aktifkan'}
                 </button>
                 <button type="button" className="tool-btn refresh-storage" onClick={onPushTest}
                   disabled={busy || !pushSubscribed}>
