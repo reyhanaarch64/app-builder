@@ -123,7 +123,7 @@ ANDROID_BUILDER_IMAGE=android-web-ide-builder:amd64 \
 
 ## Build workflow
 
-1. Create a Kotlin or Java Empty App, or import an Android Studio ZIP.
+1. Create a Kotlin or Java Empty App, or choose **Import project** on the dashboard to load an Android Studio ZIP from the device into IndexedDB.
 2. Edit files in the browser; project files are saved in IndexedDB.
 3. Choose **Build APK**, then select Debug or Release. The browser hashes project files (caching hashes in IndexedDB until file contents change), sends a manifest, and uploads only binary assets missing from this browser's cache.
 4. The API verifies binary SHA-256 and size, assembles the Android project from text and owner-scoped immutable blobs, then validates the single-module structure.

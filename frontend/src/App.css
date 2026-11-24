@@ -177,11 +177,10 @@ small { color:var(--muted); font-size:10px; font-weight:800; letter-spacing:1.3p
   .tabs { height:46px; }
   .tab { height:34px; min-width:118px; }
   .home { padding:18px 12px; }
-  .home-head { align-items:center; }
+  .home-head { flex-direction:column; align-items:flex-start; gap:12px; }
   .home-head h1 { font-size:23px; }
-  .home-actions { gap:4px; }
-  .artifact-dashboard-btn { width:36px; justify-content:center; padding:0; }
-  .artifact-dashboard-btn { font-size:0; }
+  .home-actions { width:100%; flex-wrap:wrap; gap:6px; }
+  .artifact-dashboard-btn { width:auto; justify-content:center; padding:0 10px; font-size:12px; white-space:nowrap; }
   .project-grid { grid-template-columns:1fr; }
   .form-row { grid-template-columns:1fr; gap:0; }
   .modal { max-height:calc(100vh - 32px); overflow:auto; }

@@ -324,6 +324,7 @@ function App() {
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [buildOpen, setBuildOpen] = useState(false)
   const [buildOptionsOpen, setBuildOptionsOpen] = useState(false)
+  const [importingZip, setImportingZip] = useState(false)
   const [buildStatus, setBuildStatus] = useState<Build['status'] | 'idle'>('idle')
   const [buildVariant, setBuildVariant] = useState<Build['variant']>('debug')
   const [buildCanceling, setBuildCanceling] = useState(false)
@@ -365,6 +366,7 @@ function App() {
   const buildCancelRequested = useRef(false)
   const pendingBuildId = useRef<string | null>(null)
   const [buildHistory, setBuildHistory] = useState<Build[]>([])
+  const projectZipInput = useRef<HTMLInputElement>(null)
   const [restoreProjectId] = useState(() => localStorage.getItem('android-web-ide.activeProjectId'))
   const cachedAccessMode = localStorage.getItem(accessModeKey)
   const authMode = authStatus?.mode ?? (cachedAccessMode === 'public' ? 'public' : 'private')
@@ -819,43 +821,77 @@ function App() {
   }
 
   async function importZip(file: File) {
+    if (importingZip) return
+    setImportingZip(true)
     try {
+      if (file.size > 250 * 1024 * 1024) throw new Error('Ukuran ZIP melebihi 250 MB')
       const zip = await JSZip.loadAsync(file)
       const projectId = uid()
       const now = Date.now()
-      let projectName = file.name.replace(/\.zip$/i, '') || 'Imported App'
+      const projectName = file.name.replace(/\.zip$/i, '') || 'Imported App'
       const imported: ProjectFile[] = []
+      let totalBytes = 0
       for (const [path, entry] of Object.entries(zip.files)) {
-        const clean = path.replace(/^\/+/, '')
-        if (!clean || entry.dir || /(^|\/)(\.git|\.idea|build|\.gradle)(\/|$)/.test(clean) ||
+        const clean = path.replace(/^(\.\/)+/, '')
+        if (!clean || entry.dir) continue
+        if (clean.startsWith('/') || clean.includes('\\') ||
+            clean.split('/').some(part => !part || part === '.' || part === '..')) {
+          throw new Error(`Path ZIP tidak valid: ${clean}`)
+        }
+        const segments = clean.split('/')
+        if (segments.some(part => ['.git', '.idea', '.gradle'].includes(part)) ||
+            segments.some((part, index) => part === 'build' && (index === 0 || segments[index - 1] === 'app')) ||
             /(^|\/)(local\.properties|.*\.iml)$/.test(clean)) continue
         const lower = clean.toLowerCase()
-        const text = /\.(kt|java|xml|gradle|kts|properties|json|txt|md|pro)$/i.test(lower)
+        const text = /\.(kt|java|xml|gradle|kts|properties|json|txt|md|pro|toml|ya?ml|sh|aidl|cfg|conf|html|css|js)$/i.test(lower)
         const content = text ? await entry.async('string') : undefined
         const binary = text ? undefined : await entry.async('blob')
-        const mimeType = binary?.type || 'application/octet-stream'
-        void mimeType
-        imported.push({ id: uid(), projectId, path: clean, type: 'file', content, binary,
-          size: binary?.size ?? new Blob([content ?? '']).size, createdAt: now, updatedAt: now })
+        const size = binary?.size ?? new Blob([content ?? '']).size
+        if (size > 50 * 1024 * 1024) throw new Error(`File ZIP melebihi 50 MB: ${clean}`)
+        totalBytes += size
+        if (totalBytes > 250 * 1024 * 1024) throw new Error('Ukuran project setelah diekstrak melebihi 250 MB')
+        imported.push({ id: uid(), projectId, path: clean, type: 'file', content, binary, size, createdAt: now, updatedAt: now })
+        if (imported.length > 20000) throw new Error('Project memiliki lebih dari 20.000 file')
       }
-      if (!imported.some(f => /(^|\/)(settings\.gradle(\.kts)?|build\.gradle(\.kts)?)$/.test(f.path))) {
-        throw new Error('ZIP tidak memiliki settings.gradle/build.gradle yang dikenali')
+
+      const settingsFiles = imported.filter(file => /(^|\/)settings\.gradle(\.kts)?$/.test(file.path))
+      const roots = [...new Set(settingsFiles.map(file => {
+        const slash = file.path.lastIndexOf('/')
+        return slash < 0 ? '' : file.path.slice(0, slash + 1)
+      }))]
+      const projectRoots = roots.filter(root =>
+        (imported.some(file => file.path === `${root}app/build.gradle` || file.path === `${root}app/build.gradle.kts`)) &&
+        imported.some(file => file.path === `${root}app/src/main/AndroidManifest.xml`))
+      if (projectRoots.length !== 1) {
+        throw new Error(projectRoots.length > 1
+          ? 'ZIP berisi lebih dari satu project Android; import project single-module saja'
+          : 'ZIP harus berisi settings.gradle, app/build.gradle, dan AndroidManifest.xml')
       }
-      const manifest = imported.find(f => f.path.endsWith('/AndroidManifest.xml') || f.path === 'AndroidManifest.xml')
+      const root = projectRoots[0]
+      const projectFiles = imported
+        .filter(file => file.path.startsWith(root))
+        .map(file => ({ ...file, path: file.path.slice(root.length) }))
+      const manifest = projectFiles.find(file => file.path === 'app/src/main/AndroidManifest.xml')
       const manifestMatch = manifest?.content?.match(/<manifest[^>]*package=["']([^"']+)/)
       const project: Project = {
         id: projectId, name: projectName,
         packageName: manifestMatch?.[1] || 'com.example.imported',
-        language: imported.some(f => f.path.endsWith('.kt')) ? 'kotlin' : 'java',
+        language: projectFiles.some(file => file.path.endsWith('.kt')) ? 'kotlin' : 'java',
         templateId: 'imported', minSdk: 24, targetSdk: 34, createdAt: now, updatedAt: now,
       }
-      await db.projects.add(project)
-      await db.files.bulkAdd(imported)
+      const invalidReason = validateBuildProject(project, projectFiles)
+      if (invalidReason) throw new Error(invalidReason)
+      await db.transaction('rw', db.projects, db.files, async () => {
+        await db.projects.add(project)
+        await db.files.bulkAdd(projectFiles)
+      })
       setProjects(prev => [project, ...prev])
       setActiveProjectId(projectId)
       setToast('Project ZIP berhasil diimpor')
     } catch (error) {
       setToast(error instanceof Error ? error.message : 'Gagal mengimpor ZIP')
+    } finally {
+      setImportingZip(false)
     }
   }
 
@@ -1252,7 +1288,12 @@ function App() {
         {activeProject ? (
           <>
             <div className="sidebar-actions">
-              <label className="tool-btn" title="Import ZIP"><Upload size={15}/><input type="file" accept=".zip" onChange={e => e.target.files?.[0] && importZip(e.target.files[0])}/></label>
+              <label className="tool-btn" title="Import ZIP"><Upload size={15}/><input type="file" accept=".zip" disabled={importingZip} onChange={event => {
+                const input = event.currentTarget
+                const file = input.files?.[0]
+                input.value = ''
+                if (file) void importZip(file)
+              }}/></label>
               <button className="tool-btn" title="File baru" onClick={createFile}><FilePlus2 size={15}/></button>
               <button className="tool-btn" title="Export ZIP" onClick={exportProject}><Download size={15}/></button>
               <button className="tool-btn" title="Folder baru"><FolderPlus size={15}/></button>
@@ -1304,6 +1345,15 @@ function App() {
             <div className="home-head"><div><small>ANDROID PROJECTS</small><h1>Workspace</h1></div>
               <div className="home-actions">
                 <button className="tool-btn artifact-dashboard-btn" onClick={openArtifacts} disabled={!onlineAccess}><Archive size={16}/>APK tersimpan</button>
+                <button className="tool-btn artifact-dashboard-btn" onClick={() => projectZipInput.current?.click()} disabled={importingZip}>
+                  <Upload size={16}/>{importingZip ? 'Memproses ZIP...' : 'Import project'}
+                </button>
+                <input ref={projectZipInput} type="file" accept=".zip" style={{ display: 'none' }} onChange={event => {
+                  const input = event.currentTarget
+                  const file = input.files?.[0]
+                  input.value = ''
+                  if (file) void importZip(file)
+                }}/>
                 <button className="primary-btn" onClick={() => setShowCreate(true)}><PackagePlus size={17}/>Project baru</button>
               </div>
             </div>
