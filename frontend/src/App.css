@@ -77,13 +77,21 @@ small { color:var(--muted); font-size:10px; font-weight:800; letter-spacing:1.3p
 .cleanup-options span { display:flex; flex-direction:column; gap:2px; }
 .cleanup-options strong { color:#dce5ef; font-size:12px; }
 .cleanup-options small { color:#8491a2; font-size:10px; font-weight:400; letter-spacing:0; }
-.cleanup-token { display:flex; flex-direction:column; gap:6px; margin:12px 0; color:#aab5c3; font-size:11px; }
-.cleanup-token input { height:38px; border:1px solid #303946; border-radius:7px; outline:0; background:#0d1217; color:#edf3fa; padding:0 10px; }
 .storage-actions { display:flex; justify-content:space-between; gap:8px; margin-top:12px; }
 .refresh-storage { width:auto; padding:0 10px; font-size:11px; }
 .danger-btn { min-height:38px; border:1px solid #773c43; border-radius:8px; background:#5a282e; color:#ffe2e2; padding:0 12px; font-weight:700; font-size:11px; }
 .danger-btn:hover { background:#773139; }
 .danger-btn:disabled,.refresh-storage:disabled { opacity:.5; cursor:wait; }
+.login-screen { min-height:100vh; display:grid; place-items:center; padding:16px; background:radial-gradient(ellipse at 50% 25%,#172329 0,#0b0f14 55%); }
+.login-card { width:min(390px,100%); display:flex; flex-direction:column; align-items:stretch; border:1px solid var(--line); border-radius:14px; background:#141922; padding:24px; box-shadow:0 24px 80px rgba(0,0,0,.45); }
+.login-card .brand-mark { width:42px; height:42px; margin-bottom:18px; }
+.login-card h1 { margin:7px 0 4px; color:#e7edf5; font-size:23px; letter-spacing:-.3px; }
+.login-card p { color:#8f9aaa; font-size:12px; }
+.login-card label { display:flex; flex-direction:column; gap:7px; margin-top:20px; color:#adb7c5; font-size:12px; font-weight:700; }
+.login-card input { height:44px; border:1px solid #303946; border-radius:8px; outline:0; background:#0d1217; color:#edf3fa; padding:0 10px; }
+.login-card input:focus { border-color:#49be9b; }
+.login-error { margin-top:10px; border:1px solid #773c43; border-radius:7px; background:#351f24; color:#ffc6cb; padding:8px 10px; font-size:12px; }
+.login-card .primary-btn { margin-top:16px; }
 .build-sheet { position:fixed; z-index:80; right:12px; top:70px; width:min(430px,calc(100vw - 24px)); max-height:calc(100vh - 82px); display:flex; flex-direction:column; border:1px solid var(--line); border-radius:12px; background:#121820; box-shadow:0 18px 60px rgba(0,0,0,.55); overflow:hidden; }
 .build-head { height:62px; display:flex; align-items:center; justify-content:space-between; padding:10px 12px 10px 16px; border-bottom:1px solid var(--line); }
 .build-head div { display:flex; flex-direction:column; }

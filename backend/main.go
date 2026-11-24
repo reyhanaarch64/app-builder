@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -36,30 +37,59 @@ type Build struct {
 	Artifact   string `json:"artifact,omitempty"`
 }
 
+type BuildConfig struct {
+	MaxUploadMB    int `json:"maxUploadMB"`
+	TimeoutMinutes int `json:"timeoutMinutes"`
+	MemoryMB       int `json:"memoryMB"`
+	CPUs           int `json:"cpus"`
+	Parallel       int `json:"parallel"`
+}
+
+type AppConfig struct {
+	Mode            string      `json:"mode"`
+	Password        string      `json:"password"`
+	Port            int         `json:"port"`
+	SessionTTLHours int         `json:"sessionTTLHours"`
+	SecureCookie    bool        `json:"secureCookie"`
+	Build           BuildConfig `json:"build"`
+}
+
+type session struct {
+	expiresAt time.Time
+}
+
+type loginAttempts struct {
+	times []time.Time
+}
+
 type Server struct {
 	db            *sql.DB
 	dataDir       string
 	hostDataDir   string
-	cleanupToken  string
+	config        AppConfig
 	buildSlots    chan struct{}
 	cacheSizeFn   func() (int64, error)
 	buildMu       sync.Mutex
 	maintenanceMu sync.Mutex
 	building      map[string]bool
+	sessionMu     sync.Mutex
+	sessions      map[string]session
+	loginMu       sync.Mutex
+	loginFailures map[string]loginAttempts
 }
 
 func main() {
 	dataDir := env("DATA_DIR", "/root/android-web-ide/data")
 	hostDataDir := env("HOST_DATA_DIR", dataDir)
 	webDir := env("WEB_DIR", "/root/android-web-ide/frontend/dist")
-	port := env("PORT", "8866")
+	configPath := env("IDE_CONFIG", filepath.Join(dataDir, "IDE.config"))
 	if err := os.MkdirAll(filepath.Join(dataDir, "workspaces"), 0750); err != nil {
 		log.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(dataDir, "artifacts"), 0750); err != nil {
 		log.Fatal(err)
 	}
-	cleanupToken, err := loadOrCreateCleanupToken(dataDir)
+	config, err := loadConfig(configPath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -72,19 +102,23 @@ func main() {
 	schema(db)
 
 	s := &Server{
-		db: db, dataDir: dataDir, hostDataDir: hostDataDir,
-		cleanupToken: cleanupToken, buildSlots: make(chan struct{}, 1), building: map[string]bool{},
+		db: db, dataDir: dataDir, hostDataDir: hostDataDir, config: config,
+		buildSlots: make(chan struct{}, config.Build.Parallel), building: map[string]bool{},
+		sessions: make(map[string]session), loginFailures: make(map[string]loginAttempts),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.handleHealth)
+	mux.HandleFunc("/api/auth/status", s.handleAuthStatus)
+	mux.HandleFunc("/api/auth/login", s.handleLogin)
+	mux.HandleFunc("/api/auth/logout", s.handleLogout)
 	mux.HandleFunc("/api/builds", s.handleBuildCollection)
 	mux.HandleFunc("/api/builds/", s.handleBuildRoutes)
 	mux.HandleFunc("/api/maintenance/storage", s.handleStorage)
 	mux.HandleFunc("/api/maintenance/cleanup", s.handleCleanup)
 	mux.Handle("/", http.FileServer(http.Dir(webDir)))
 
-	log.Printf("android web ide listening on http://0.0.0.0:%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, withCORS(mux)))
+	log.Printf("android web ide mode=%s listening on http://0.0.0.0:%d", config.Mode, config.Port)
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", config.Port), s.authMiddleware(mux)))
 }
 
 func schema(db *sql.DB) {
@@ -124,43 +158,59 @@ func schema(db *sql.DB) {
 	}
 }
 
-func loadOrCreateCleanupToken(dataDir string) (string, error) {
-	if token := os.Getenv("CLEANUP_TOKEN"); token != "" {
-		return token, nil
+func defaultConfig() AppConfig {
+	return AppConfig{
+		Mode: "public", Port: 8866, SessionTTLHours: 168, SecureCookie: true,
+		Build: BuildConfig{MaxUploadMB: 50, TimeoutMinutes: 30, MemoryMB: 4096, CPUs: 2, Parallel: 1},
 	}
-	path := filepath.Join(dataDir, "cleanup.token")
-	tokenBytes := make([]byte, 32)
-	if _, err := rand.Read(tokenBytes); err != nil {
-		return "", err
+}
+
+func loadConfig(path string) (AppConfig, error) {
+	config := defaultConfig()
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		data, err = json.MarshalIndent(config, "", "  ")
+		if err != nil {
+			return config, err
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+			return config, err
+		}
+		if err := os.WriteFile(path, append(data, '\n'), 0600); err != nil {
+			return config, err
+		}
+		log.Printf("created default public config at %s", path)
+		return config, nil
 	}
-	token := hex.EncodeToString(tokenBytes)
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
-		if !errors.Is(err, os.ErrExist) {
-			return "", err
-		}
-		existing, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return "", readErr
-		}
-		token = strings.TrimSpace(string(existing))
-		if token == "" {
-			return "", errors.New("cleanup token file kosong")
-		}
-	} else {
-		if _, err := file.WriteString(token + "\n"); err != nil {
-			file.Close()
-			os.Remove(path)
-			return "", err
-		}
-		if err := file.Close(); err != nil {
-			return "", err
-		}
+		return config, err
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return config, fmt.Errorf("invalid IDE.config: %w", err)
+	}
+	if config.Mode != "public" && config.Mode != "private" {
+		return config, errors.New(`IDE.config "mode" must be "public" or "private"`)
+	}
+	if config.Port < 1 || config.Port > 65535 {
+		return config, errors.New("IDE.config port must be between 1 and 65535")
+	}
+	if config.SessionTTLHours < 1 || config.SessionTTLHours > 8760 {
+		return config, errors.New("IDE.config sessionTTLHours must be between 1 and 8760")
+	}
+	if config.Mode == "private" && len([]rune(config.Password)) < 8 {
+		return config, errors.New("private mode requires a password with at least 8 characters")
+	}
+	if config.Build.MaxUploadMB < 1 || config.Build.MaxUploadMB > 1024 ||
+		config.Build.TimeoutMinutes < 1 || config.Build.TimeoutMinutes > 240 ||
+		config.Build.MemoryMB < 512 || config.Build.MemoryMB > 65536 ||
+		config.Build.CPUs < 1 || config.Build.CPUs > 64 ||
+		config.Build.Parallel < 1 || config.Build.Parallel > 16 {
+		return config, errors.New("IDE.config build limits are outside supported ranges")
 	}
 	if err := os.Chmod(path, 0600); err != nil {
-		return "", err
+		return config, err
 	}
-	return token, nil
+	return config, nil
 }
 
 func env(key, fallback string) string {
@@ -170,21 +220,159 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-func withCORS(next http.Handler) http.Handler {
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]any{"ok": true, "service": "android-web-ide"})
+}
+
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Cleanup-Token")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
+		isAPI := strings.HasPrefix(r.URL.Path, "/api/")
+		if isAPI {
+			w.Header().Set("Cache-Control", "no-store")
+		}
+		if s.config.Mode == "private" && isAPI &&
+			r.URL.Path != "/api/auth/status" && r.URL.Path != "/api/auth/login" &&
+			r.URL.Path != "/api/auth/logout" && r.URL.Path != "/api/health" &&
+			!s.hasValidSession(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "login required"})
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]any{"ok": true, "service": "android-web-ide"})
+func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	authenticated := s.config.Mode == "public" || s.hasValidSession(r)
+	writeJSON(w, http.StatusOK, map[string]any{"mode": s.config.Mode, "authenticated": authenticated})
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.config.Mode != "private" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "private mode is disabled"})
+		return
+	}
+	ip := clientIP(r)
+	if s.isLoginRateLimited(ip) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "terlalu banyak percobaan login; coba lagi dalam 15 menit"})
+		return
+	}
+	var body struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
+		s.recordLoginFailure(ip)
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request login tidak valid"})
+		return
+	}
+	if len(body.Password) != len(s.config.Password) ||
+		subtle.ConstantTimeCompare([]byte(body.Password), []byte(s.config.Password)) != 1 {
+		s.recordLoginFailure(ip)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "password salah"})
+		return
+	}
+	s.clearLoginFailures(ip)
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "gagal membuat session"})
+		return
+	}
+	token := hex.EncodeToString(tokenBytes)
+	expiresAt := time.Now().Add(time.Duration(s.config.SessionTTLHours) * time.Hour)
+	s.sessionMu.Lock()
+	s.sessions[token] = session{expiresAt: expiresAt}
+	s.sessionMu.Unlock()
+	http.SetCookie(w, &http.Cookie{
+		Name: "ide_session", Value: token, Path: "/", Expires: expiresAt,
+		MaxAge: int(time.Until(expiresAt).Seconds()), HttpOnly: true,
+		Secure: s.config.SecureCookie, SameSite: http.SameSiteStrictMode,
+	})
+	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if cookie, err := r.Cookie("ide_session"); err == nil {
+		s.sessionMu.Lock()
+		delete(s.sessions, cookie.Value)
+		s.sessionMu.Unlock()
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: "ide_session", Value: "", Path: "/", MaxAge: -1,
+		HttpOnly: true, Secure: s.config.SecureCookie, SameSite: http.SameSiteStrictMode,
+	})
+	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": false})
+}
+
+func (s *Server) hasValidSession(r *http.Request) bool {
+	cookie, err := r.Cookie("ide_session")
+	if err != nil {
+		return false
+	}
+	now := time.Now()
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	for token, session := range s.sessions {
+		if !now.Before(session.expiresAt) {
+			delete(s.sessions, token)
+		}
+	}
+	session, ok := s.sessions[cookie.Value]
+	return ok && now.Before(session.expiresAt)
+}
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func (s *Server) isLoginRateLimited(ip string) bool {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	now := time.Now()
+	attempts := s.loginFailures[ip]
+	recent := attempts.times[:0]
+	for _, attempt := range attempts.times {
+		if now.Sub(attempt) < 15*time.Minute {
+			recent = append(recent, attempt)
+		}
+	}
+	attempts.times = recent
+	s.loginFailures[ip] = attempts
+	return len(recent) >= 5
+}
+
+func (s *Server) recordLoginFailure(ip string) {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	attempts := s.loginFailures[ip]
+	attempts.times = append(attempts.times, time.Now())
+	s.loginFailures[ip] = attempts
+}
+
+func (s *Server) clearLoginFailures(ip string) {
+	s.loginMu.Lock()
+	delete(s.loginFailures, ip)
+	s.loginMu.Unlock()
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(value)
 }
 
 type StorageStats struct {
@@ -208,10 +396,6 @@ func (s *Server) handleStorage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.authorizedCleanupRequest(r) {
-		http.Error(w, "cleanup token tidak valid", http.StatusUnauthorized)
-		return
-	}
 	stats, err := s.storageStats()
 	if err != nil {
 		http.Error(w, "gagal membaca penggunaan storage: "+err.Error(), http.StatusInternalServerError)
@@ -224,10 +408,6 @@ func (s *Server) handleStorage(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if !s.authorizedCleanupRequest(r) {
-		http.Error(w, "cleanup token tidak valid", http.StatusUnauthorized)
 		return
 	}
 	var request CleanupRequest
@@ -310,12 +490,6 @@ func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
 		},
 		"storage": after,
 	})
-}
-
-func (s *Server) authorizedCleanupRequest(r *http.Request) bool {
-	provided := r.Header.Get("X-Cleanup-Token")
-	return len(provided) == len(s.cleanupToken) &&
-		subtle.ConstantTimeCompare([]byte(provided), []byte(s.cleanupToken)) == 1
 }
 
 func (s *Server) storageStats() (StorageStats, error) {
@@ -518,11 +692,12 @@ func (s *Server) handleBuildList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleBuildCreate(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 50<<20)
+	maxUploadBytes := int64(s.config.Build.MaxUploadMB) << 20
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	if err := r.ParseMultipartForm(8 << 20); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			http.Error(w, "ZIP project terlalu besar (maks 50 MB)", http.StatusRequestEntityTooLarge)
+			http.Error(w, fmt.Sprintf("ZIP project terlalu besar (maks %d MB)", s.config.Build.MaxUploadMB), http.StatusRequestEntityTooLarge)
 		} else {
 			http.Error(w, "multipart upload gagal", http.StatusBadRequest)
 		}
@@ -852,10 +1027,11 @@ func (s *Server) runBuild(id, workspace string) {
 		return
 	}
 	hostProjectRoot := filepath.Join(s.hostDataDir, relativeRoot)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.config.Build.TimeoutMinutes)*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "docker", "run", "--rm",
-		"--memory=4g", "--cpus=2", "--pids-limit=256",
+		fmt.Sprintf("--memory=%dm", s.config.Build.MemoryMB),
+		fmt.Sprintf("--cpus=%d", s.config.Build.CPUs), "--pids-limit=256",
 		"-v", hostProjectRoot+":/project",
 		"-v", "androidide_gradle:/root/.gradle",
 		"android-web-ide-builder",
@@ -870,7 +1046,7 @@ func (s *Server) runBuild(id, workspace string) {
 	go s.copyLogs(id, "stderr", stderr)
 	err = cmd.Wait()
 	if ctx.Err() == context.DeadlineExceeded {
-		s.failBuild(id, "build timeout 30 menit")
+		s.failBuild(id, fmt.Sprintf("build timeout %d menit", s.config.Build.TimeoutMinutes))
 		return
 	}
 	if err != nil {

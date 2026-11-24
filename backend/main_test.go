@@ -97,30 +97,86 @@ func TestOnlyOneActiveBuildPerProject(t *testing.T) {
 	}
 }
 
-func TestCleanupTokenIsPersistentAndPrivate(t *testing.T) {
-	t.Setenv("CLEANUP_TOKEN", "")
-	dataDir := t.TempDir()
-	first, err := loadOrCreateCleanupToken(dataDir)
+func TestLoadConfigCreatesPrivateDefaultFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data", "IDE.config")
+	config, err := loadConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := loadOrCreateCleanupToken(dataDir)
-	if err != nil {
-		t.Fatal(err)
+	if config.Mode != "public" || config.Port != 8866 || config.Build.Parallel != 1 {
+		t.Fatalf("unexpected default config: %+v", config)
 	}
-	if first != second || len(first) != 64 {
-		t.Fatal("cleanup token was not persisted correctly")
-	}
-	info, err := os.Stat(filepath.Join(dataDir, "cleanup.token"))
+	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if info.Mode().Perm() != 0600 {
-		t.Fatalf("expected private token file mode 0600, got %04o", info.Mode().Perm())
+		t.Fatalf("expected IDE.config mode 0600, got %04o", info.Mode().Perm())
 	}
 }
 
-func TestCleanupRequiresTokenAndDoesNotTouchActiveBuild(t *testing.T) {
+func TestLoadConfigRejectsPrivateModeWithoutPassword(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "IDE.config")
+	content := `{"mode":"private","password":"","port":8866,"sessionTTLHours":168,"secureCookie":true,"build":{"maxUploadMB":50,"timeoutMinutes":30,"memoryMB":4096,"cpus":2,"parallel":1}}`
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path); err == nil || !strings.Contains(err.Error(), "password") {
+		t.Fatalf("expected private password validation error, got %v", err)
+	}
+}
+
+func TestPrivateModeRequiresSessionButPublicModeDoesNot(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	request := httptest.NewRequest(http.MethodGet, "/api/builds", nil)
+	privateServer := &Server{config: AppConfig{Mode: "private"}, sessions: make(map[string]session)}
+	privateResponse := httptest.NewRecorder()
+	privateServer.authMiddleware(handler).ServeHTTP(privateResponse, request)
+	if privateResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("expected private endpoint to require session, got %d", privateResponse.Code)
+	}
+	privateResponse = httptest.NewRecorder()
+	privateServer.authMiddleware(handler).ServeHTTP(privateResponse,
+		httptest.NewRequest(http.MethodGet, "/api/auth/status", nil))
+	if privateResponse.Code != http.StatusNoContent {
+		t.Fatalf("expected auth status endpoint to remain public, got %d", privateResponse.Code)
+	}
+
+	publicServer := &Server{config: AppConfig{Mode: "public"}}
+	publicResponse := httptest.NewRecorder()
+	publicServer.authMiddleware(handler).ServeHTTP(publicResponse, request)
+	if publicResponse.Code != http.StatusNoContent {
+		t.Fatalf("expected public endpoint to stay open, got %d", publicResponse.Code)
+	}
+}
+
+func TestPrivateLoginSetsSecureSessionCookie(t *testing.T) {
+	server := &Server{
+		config:   AppConfig{Mode: "private", Password: "strong-password", SessionTTLHours: 24, SecureCookie: true},
+		sessions: make(map[string]session), loginFailures: make(map[string]loginAttempts),
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"password":"strong-password"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	server.handleLogin(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected successful login, got %d: %s", response.Code, response.Body.String())
+	}
+	cookies := response.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != "ide_session" || !cookies[0].HttpOnly ||
+		!cookies[0].Secure || cookies[0].SameSite != http.SameSiteStrictMode {
+		t.Fatalf("unexpected session cookie: %+v", cookies)
+	}
+	sessionRequest := httptest.NewRequest(http.MethodGet, "/api/builds", nil)
+	sessionRequest.AddCookie(cookies[0])
+	if !server.hasValidSession(sessionRequest) {
+		t.Fatal("expected login session to authorize private API")
+	}
+}
+
+func TestCleanupRejectsActiveBuildInPrivateMode(t *testing.T) {
 	db := testDB(t)
 	dataDir := t.TempDir()
 	workspace := filepath.Join(dataDir, "workspaces", "active")
@@ -135,18 +191,23 @@ func TestCleanupRequiresTokenAndDoesNotTouchActiveBuild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &Server{db: db, dataDir: dataDir, cleanupToken: "secret"}
+	server := &Server{
+		db: db, dataDir: dataDir,
+		config:   AppConfig{Mode: "private", Password: "password123", SessionTTLHours: 24},
+		sessions: map[string]session{"valid-session": {expiresAt: time.Now().Add(time.Hour)}},
+		building: make(map[string]bool),
+	}
 	body, _ := json.Marshal(CleanupRequest{Workspaces: true})
 	unauthorized := httptest.NewRecorder()
 	unauthorizedRequest := httptest.NewRequest(http.MethodPost, "/api/maintenance/cleanup", strings.NewReader(string(body)))
-	server.handleCleanup(unauthorized, unauthorizedRequest)
+	server.authMiddleware(http.HandlerFunc(server.handleCleanup)).ServeHTTP(unauthorized, unauthorizedRequest)
 	if unauthorized.Code != http.StatusUnauthorized {
 		t.Fatalf("expected unauthorized response, got %d", unauthorized.Code)
 	}
 	request := httptest.NewRequest(http.MethodPost, "/api/maintenance/cleanup", strings.NewReader(string(body)))
-	request.Header.Set("X-Cleanup-Token", "secret")
+	request.AddCookie(&http.Cookie{Name: "ide_session", Value: "valid-session"})
 	response := httptest.NewRecorder()
-	server.handleCleanup(response, request)
+	server.authMiddleware(http.HandlerFunc(server.handleCleanup)).ServeHTTP(response, request)
 	if response.Code != http.StatusConflict {
 		t.Fatalf("expected active-build conflict, got %d: %s", response.Code, response.Body.String())
 	}
@@ -214,12 +275,11 @@ func TestCleanupRemovesSelectedBuildDataButKeepsHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := &Server{
-		db: db, dataDir: dataDir, cleanupToken: "secret",
+		db: db, dataDir: dataDir,
 		cacheSizeFn: func() (int64, error) { return 0, nil },
 	}
 	body, _ := json.Marshal(CleanupRequest{Workspaces: true, Artifacts: true})
 	request := httptest.NewRequest(http.MethodPost, "/api/maintenance/cleanup", strings.NewReader(string(body)))
-	request.Header.Set("X-Cleanup-Token", "secret")
 	response := httptest.NewRecorder()
 	server.handleCleanup(response, request)
 	if response.Code != http.StatusOK {

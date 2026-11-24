@@ -2,7 +2,7 @@
 
 App Builder is a self-hosted, mobile-friendly Android IDE. Projects are kept in the browser's IndexedDB; the server receives a ZIP snapshot only when a build is requested, then builds a debug APK in an isolated Docker container.
 
-The current MVP supports single-module Android projects using Kotlin or Java with XML Views, debug APK builds, ZIP import/export, a Monaco editor, persistent build history, and build log streaming. It does not currently support release signing, Compose, NDK, multi-module projects, or public multi-user access.
+The current MVP supports single-module Android projects using Kotlin or Java with XML Views, debug APK builds, ZIP import/export, a Monaco editor, persistent build history, build log streaming, and configurable public/private access. It does not currently support release signing, Compose, NDK, or multi-module projects.
 
 ## Requirements
 
@@ -31,13 +31,42 @@ This baseline is intended for one Android build at a time. Builds are serialized
 From the repository root:
 
 ```bash
-npm --prefix frontend ci
-npm --prefix frontend run build
-docker build -t android-web-ide-builder ./build-image
-HOST_DATA_DIR="$(pwd)/data" docker compose up --build -d
+bash start.sh
 ```
 
-The web app and API are served together on port `8866`. Compose stores the SQLite database, workspaces, and APK artifacts in `./data`. `HOST_DATA_DIR` must be an absolute path to the same host directory mounted at `/data`; the Docker daemon uses this path when it mounts a project into a build container.
+`start.sh` creates `data/IDE.config` from the tracked `IDE.config` template if needed, builds the frontend and Android builder image, starts/restarts the web app and API, then waits for its health endpoint. It also supports `bash start.sh stop`, `status`, `logs`, and `restart`.
+
+The web app and API are served together on the port in `data/IDE.config` (default `8866`). Compose stores the SQLite database, workspaces, APK artifacts, and config in `./data`. `HOST_DATA_DIR` is set by the startup script to the absolute host path needed when Docker mounts a project into an isolated build container.
+
+## Access mode
+
+Edit `data/IDE.config`; access mode is not controlled from the web UI. The service reads config at startup, so apply changes with `bash start.sh restart`.
+
+- `"mode": "public"` leaves the IDE and its APIs open to anyone who can reach the URL.
+- `"mode": "private"` shows a password login and requires a valid session for project/build APIs, build logs, APK downloads, and storage cleanup.
+- Set `"password"` to a password of at least 8 characters before switching to private mode. The local config file is created with permission `0600` and is ignored by Git.
+- `"secureCookie": true` is recommended when serving the IDE through HTTPS. For local plain-HTTP development only, set it to `false`.
+
+Example:
+
+```json
+{
+  "mode": "private",
+  "password": "replace-this-with-a-long-password",
+  "port": 8866,
+  "sessionTTLHours": 168,
+  "secureCookie": true,
+  "build": {
+    "maxUploadMB": 50,
+    "timeoutMinutes": 30,
+    "memoryMB": 4096,
+    "cpus": 2,
+    "parallel": 1
+  }
+}
+```
+
+In public mode, all app APIs—including cleanup—are public by design. Only use it when the host and its resources are intentionally open to visitors.
 
 Check that the API is ready:
 
@@ -59,7 +88,7 @@ cd ..
 DATA_DIR="$(pwd)/data" \
 HOST_DATA_DIR="$(pwd)/data" \
 WEB_DIR="$(pwd)/frontend/dist" \
-PORT=8866 ./android-ide-server
+IDE_CONFIG="$(pwd)/data/IDE.config" ./android-ide-server
 ```
 
 `DATA_DIR` is where the API stores its SQLite database, temporary project workspaces, and APK artifacts. `HOST_DATA_DIR` must point to the same directory as seen by the host Docker daemon.
@@ -84,13 +113,11 @@ Each browser project has a stable ID. A second build for that project is rejecte
 
 Open the drive icon in the web UI to inspect storage and choose what to remove. Active builds block cleanup. The history option also removes associated APKs and workspaces; browser projects in IndexedDB are not affected.
 
-Cleanup and storage inspection require an admin token. On first start the server creates `DATA_DIR/cleanup.token` with file permissions `0600`; read it on the VPS and enter it in the UI. Alternatively, set `CLEANUP_TOKEN` in the server environment. The token is not returned by the API and should not be committed or shared.
-
 ## Security notes
 
-**Do not expose this service directly to the public internet as-is.** The current MVP does not implement user authentication or authorization. Anyone who can reach the API can submit build jobs and consume server resources. Build scripts are untrusted input even though they run in a separate container. Restrict access with a trusted network, VPN, firewall, or an authenticated reverse proxy.
+In public mode, anyone who can reach the service can submit build jobs, download artifacts, and use cleanup; this is intentional for a public instance. Use private mode when the service is for personal use. Build scripts are untrusted input even though they run in a separate container.
 
-The API container needs access to the Docker socket to start build containers. Access to that socket is highly privileged; only run the service on a host you control, and do not give untrusted users access to the API. Build workspaces and artifacts are stored on the server and should be protected and cleaned up according to your retention needs.
+The API container needs access to the Docker socket to start build containers. Access to that socket is highly privileged; only run the service on a host you control. Keep `data/IDE.config` private, use HTTPS when password login is enabled, and protect server-side workspaces and APK artifacts.
 
 ## Development
 

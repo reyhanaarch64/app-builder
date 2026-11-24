@@ -4,12 +4,12 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8866:8866"
+      - "${IDE_PORT:-8866}:${IDE_PORT:-8866}"
     environment:
-      PORT: "8866"
       DATA_DIR: "/data"
       HOST_DATA_DIR: ${HOST_DATA_DIR:?set HOST_DATA_DIR to an absolute host path}
       WEB_DIR: "/app/frontend/dist"
+      IDE_CONFIG: "/data/IDE.config"
     volumes:
       - ./data:/data
       - /var/run/docker.sock:/var/run/docker.sock

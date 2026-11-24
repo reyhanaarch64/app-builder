@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import Editor from '@monaco-editor/react'
 import Dexie, { type Table } from 'dexie'
 import JSZip from 'jszip'
 import {
   Box, ChevronRight, Download, FileCode2, FilePlus2, FolderPlus, HardDrive,
-  Menu, PackagePlus, Play, Search, Trash2, Upload,
+  LogOut, Menu, PackagePlus, Play, Search, Trash2, Upload,
   X,
 } from 'lucide-react'
 import './App.css'
@@ -58,6 +58,8 @@ type CleanupOptions = {
   history: boolean
   gradleCache: boolean
 }
+
+type AuthStatus = { mode: 'public' | 'private'; authenticated: boolean }
 
 class IDEDatabase extends Dexie {
   projects!: Table<Project, string>
@@ -213,7 +215,10 @@ function App() {
   const [storageOpen, setStorageOpen] = useState(false)
   const [storageLoading, setStorageLoading] = useState(false)
   const [storageStats, setStorageStats] = useState<StorageStats | null>(null)
-  const [cleanupToken, setCleanupToken] = useState('')
+  const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null)
+  const [loginPassword, setLoginPassword] = useState('')
+  const [loginError, setLoginError] = useState('')
+  const [loginLoading, setLoginLoading] = useState(false)
   const [cleanupOptions, setCleanupOptions] = useState<CleanupOptions>({
     workspaces: true, artifacts: true, history: false, gradleCache: false,
   })
@@ -221,15 +226,47 @@ function App() {
   const buildEvents = useRef<EventSource | null>(null)
   const [buildHistory, setBuildHistory] = useState<Build[]>([])
   const [restoreProjectId] = useState(() => localStorage.getItem('android-web-ide.activeProjectId'))
+  const authenticated = authStatus?.mode === 'public' || authStatus?.authenticated === true
   const activeProject = projects.find(p => p.id === activeProjectId) ?? null
   const activeFile = files.find(f => f.id === activeFileId) ?? null
 
   useEffect(() => {
+    let disposed = false
+    fetch('/api/auth/status')
+      .then(async response => {
+        if (!response.ok) throw new Error(await response.text())
+        return response.json() as Promise<AuthStatus>
+      })
+      .then(status => { if (!disposed) setAuthStatus(status) })
+      .catch(error => {
+        if (!disposed) setLoginError(error instanceof Error ? error.message : 'gagal menghubungi server')
+      })
+    return () => { disposed = true }
+  }, [])
+
+  useEffect(() => {
+    if (authStatus?.mode !== 'private' || !authStatus.authenticated) return
+    const timer = window.setInterval(() => {
+      fetch('/api/auth/status')
+        .then(response => response.ok ? response.json() as Promise<AuthStatus> : null)
+        .then(status => {
+          if (status && !status.authenticated) {
+            setAuthStatus(status)
+            setLoginError('session berakhir, masuk lagi untuk melanjutkan')
+          }
+        })
+        .catch(() => undefined)
+    }, 30_000)
+    return () => window.clearInterval(timer)
+  }, [authStatus])
+
+  useEffect(() => {
+    if (!authenticated) return
     db.projects.orderBy('updatedAt').reverse().toArray().then(items => {
       setProjects(items)
       if (restoreProjectId && items.some(project => project.id === restoreProjectId)) setActiveProjectId(restoreProjectId)
     })
-  }, [restoreProjectId])
+  }, [authenticated, restoreProjectId])
 
   useEffect(() => {
     if (activeProjectId) localStorage.setItem('android-web-ide.activeProjectId', activeProjectId)
@@ -244,7 +281,7 @@ function App() {
   useEffect(() => {
     buildEvents.current?.close()
     buildEvents.current = null
-    if (!activeProjectId) {
+    if (!authenticated || !activeProjectId) {
       setBuildHistory([])
       setBuildId(null)
       setBuildStatus('idle')
@@ -280,7 +317,7 @@ function App() {
       buildEvents.current?.close()
       buildEvents.current = null
     }
-  }, [activeProjectId])
+  }, [activeProjectId, authenticated])
 
   useEffect(() => {
     if (!toast) return
@@ -292,16 +329,49 @@ function App() {
     search ? files.filter(f => f.path.toLowerCase().includes(search.toLowerCase())) : files
   ), [files, search])
 
-  async function refreshStorageStats() {
-    if (!cleanupToken.trim()) {
-      setToast('Masukkan cleanup token untuk membaca storage')
-      return
+  async function submitLogin(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setLoginLoading(true)
+    setLoginError('')
+    try {
+      const response = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: loginPassword }),
+      })
+      const body = await response.json() as { error?: string; authenticated?: boolean }
+      if (!response.ok) throw new Error(body.error || 'login gagal')
+      setAuthStatus({ mode: 'private', authenticated: true })
+      setLoginPassword('')
+    } catch (error) {
+      setLoginError(error instanceof Error ? error.message : 'login gagal')
+    } finally {
+      setLoginLoading(false)
     }
+  }
+
+  async function logout() {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' })
+      buildEvents.current?.close()
+      setAuthStatus({ mode: 'private', authenticated: false })
+      setActiveProjectId(null)
+      setProjects([])
+      setFiles([])
+      setBuildHistory([])
+      setBuildId(null)
+      setBuildStatus('idle')
+      setLogs([])
+      setBuildOpen(false)
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'logout gagal')
+    }
+  }
+
+  async function refreshStorageStats() {
     setStorageLoading(true)
     try {
-      const response = await fetch('/api/maintenance/storage', {
-        headers: { 'X-Cleanup-Token': cleanupToken },
-      })
+      const response = await fetch('/api/maintenance/storage')
       if (!response.ok) throw new Error(await response.text())
       setStorageStats(await response.json() as StorageStats)
     } catch (error) {
@@ -316,10 +386,6 @@ function App() {
   }
 
   async function cleanStorage() {
-    if (!cleanupToken.trim()) {
-      setToast('Masukkan cleanup token dari file DATA_DIR/cleanup.token')
-      return
-    }
     if (!Object.values(cleanupOptions).some(Boolean)) {
       setToast('Pilih data yang mau dibersihkan')
       return
@@ -332,7 +398,7 @@ function App() {
     try {
       const response = await fetch('/api/maintenance/cleanup', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Cleanup-Token': cleanupToken },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(cleanupOptions),
       })
       const body = await response.text()
@@ -341,7 +407,6 @@ function App() {
       catch { data = { error: body } }
       if (!response.ok) throw new Error(data.error || `cleanup gagal (${response.status})`)
       setStorageStats(data.storage ?? null)
-      setCleanupToken('')
       setToast(`storage dibersihkan: ${formatBytes(Object.values(data.removed ?? {}).reduce((sum, size) => sum + size, 0))} dibebaskan`)
       if (cleanupOptions.history) {
         setBuildHistory([])
@@ -534,9 +599,9 @@ function App() {
       else zip.file(file.path, file.content ?? '')
     }
     const blob = await zip.generateAsync({ type: 'blob' })
-    if (blob.size > 50 * 1024 * 1024) {
+    if (blob.size > 1024 * 1024 * 1024) {
       setBuildStatus('failed')
-      setLogs(prev => [...prev, 'ZIP project melebihi batas 50 MB'])
+      setLogs(prev => [...prev, 'ZIP project melebihi batas upload maksimum'])
       return
     }
     const form = new FormData()
@@ -597,6 +662,13 @@ function App() {
     ))
   }
 
+  if (!authStatus) {
+    return <LoginScreen loading={!loginError} error={loginError} onSubmit={submitLogin} password={loginPassword} onPasswordChange={setLoginPassword} busy={loginLoading}/>
+  }
+  if (authStatus.mode === 'private' && !authenticated) {
+    return <LoginScreen error={loginError} onSubmit={submitLogin} password={loginPassword} onPasswordChange={setLoginPassword} busy={loginLoading}/>
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -607,6 +679,7 @@ function App() {
           <Play size={16} fill="currentColor"/><span>{buildStatus === 'queued' || buildStatus === 'building' ? 'Building...' : 'Build APK'}</span>
         </button>
         <button className="icon-btn storage-btn" title="Kelola storage build" onClick={openStorage}><HardDrive size={18}/></button>
+        {authStatus.mode === 'private' && <button className="icon-btn" title="Logout" onClick={logout}><LogOut size={18}/></button>}
       </header>
 
       <aside className={`sidebar ${drawerOpen ? 'open' : ''}`}>
@@ -701,9 +774,7 @@ function App() {
         <StorageDialog
           stats={storageStats}
           loading={storageLoading}
-          token={cleanupToken}
           options={cleanupOptions}
-          onTokenChange={setCleanupToken}
           onOptionChange={(key, checked) => setCleanupOptions(prev => ({ ...prev, [key]: checked }))}
           onRefresh={() => void refreshStorageStats()}
           onCleanup={cleanStorage}
@@ -715,12 +786,36 @@ function App() {
   )
 }
 
-function StorageDialog({ stats, loading, token, options, onTokenChange, onOptionChange, onRefresh, onCleanup, onClose }: {
+function LoginScreen({ loading, error, password, busy, onPasswordChange, onSubmit }: {
+  loading?: boolean
+  error: string
+  password: string
+  busy: boolean
+  onPasswordChange: (value: string) => void
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void
+}) {
+  return (
+    <main className="login-screen">
+      <form className="login-card" onSubmit={onSubmit}>
+        <div className="brand-mark"><Box size={20}/></div>
+        <small>SELF-HOSTED ANDROID IDE</small>
+        <h1>{loading ? 'menghubungkan…' : 'private workspace'}</h1>
+        <p>masukin password buat lanjut ke workspace.</p>
+        <label>password<input type="password" autoComplete="current-password" value={password}
+          onChange={event => onPasswordChange(event.target.value)} autoFocus disabled={loading} required/></label>
+        {error && <div className="login-error">{error}</div>}
+        <button className="primary-btn full" type="submit" disabled={busy || loading || !password}>
+          {busy ? 'memeriksa…' : 'masuk'}
+        </button>
+      </form>
+    </main>
+  )
+}
+
+function StorageDialog({ stats, loading, options, onOptionChange, onRefresh, onCleanup, onClose }: {
   stats: StorageStats | null
   loading: boolean
-  token: string
   options: CleanupOptions
-  onTokenChange: (value: string) => void
   onOptionChange: (key: keyof CleanupOptions, checked: boolean) => void
   onRefresh: () => void
   onCleanup: () => void
@@ -746,7 +841,6 @@ function StorageDialog({ stats, loading, token, options, onTokenChange, onOption
           <label><input type="checkbox" checked={options.history} onChange={event => onOptionChange('history', event.target.checked)}/><span><strong>riwayat dan log build</strong><small>juga menghapus workspace serta APK terkait</small></span></label>
           <label><input type="checkbox" checked={options.gradleCache} onChange={event => onOptionChange('gradleCache', event.target.checked)}/><span><strong>Gradle dependency cache</strong><small>build berikutnya perlu download dependency lagi</small></span></label>
         </div>
-        <label className="cleanup-token">cleanup token<input type="password" autoComplete="off" value={token} onChange={event => onTokenChange(event.target.value)} placeholder="CLEANUP_TOKEN atau DATA_DIR/cleanup.token"/></label>
         <div className="storage-actions">
           <button className="tool-btn refresh-storage" onClick={onRefresh} disabled={loading}>{loading ? 'memuat…' : 'refresh ukuran'}</button>
           <button className="danger-btn" onClick={onCleanup} disabled={loading}>{loading ? 'membersihkan…' : 'bersihkan yang dipilih'}</button>

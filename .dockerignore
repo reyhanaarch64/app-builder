@@ -1,5 +1,6 @@
 .git
 .env
+IDE.config
 data
 frontend/node_modules
 frontend/coverage
