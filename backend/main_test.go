@@ -27,6 +27,31 @@ func TestAndroidBuilderImage(t *testing.T) {
 	}
 }
 
+func TestFrontendFilesRequireRevalidation(t *testing.T) {
+	webDir := t.TempDir()
+	for name, content := range map[string]string{
+		"index.html": "app shell",
+		"sw.js":      "service worker",
+		"app.js":     "frontend asset",
+	} {
+		if err := os.WriteFile(filepath.Join(webDir, name), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	handler := frontendFileServer(webDir)
+	for _, path := range []string{"/", "/sw.js", "/app.js"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET %s returned %d, want %d", path, response.Code, http.StatusOK)
+		}
+		if got := response.Header().Get("Cache-Control"); got != "no-cache" {
+			t.Errorf("GET %s Cache-Control = %q, want %q", path, got, "no-cache")
+		}
+	}
+}
+
 func TestNotificationSettingsArePrivateAndDoNotExposeSMTPSecret(t *testing.T) {
 	db := testDB(t)
 	server := &Server{

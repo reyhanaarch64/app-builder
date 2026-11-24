@@ -135,11 +135,19 @@ func main() {
 	mux.HandleFunc("/api/builds/", s.handleBuildRoutes)
 	mux.HandleFunc("/api/maintenance/storage", s.handleStorage)
 	mux.HandleFunc("/api/maintenance/cleanup", s.handleCleanup)
-	mux.Handle("/", http.FileServer(http.Dir(webDir)))
+	mux.Handle("/", frontendFileServer(webDir))
 
 	go s.runEmailOutbox()
 	log.Printf("android web ide mode=%s listening on http://0.0.0.0:%d", config.Mode, config.Port)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", config.Port), s.authMiddleware(mux)))
+}
+
+func frontendFileServer(webDir string) http.Handler {
+	fileServer := http.FileServer(http.Dir(webDir))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		fileServer.ServeHTTP(w, r)
+	})
 }
 
 func schema(db *sql.DB) {
