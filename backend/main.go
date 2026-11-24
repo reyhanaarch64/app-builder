@@ -14,7 +14,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -62,7 +61,6 @@ type AppConfig struct {
 	SecureCookie    bool        `json:"secureCookie"`
 	Build           BuildConfig `json:"build"`
 	SMTP            SMTPConfig  `json:"smtp"`
-	VAPIDSubject    string      `json:"vapidSubject"`
 }
 
 type session struct {
@@ -124,17 +122,12 @@ func main() {
 		sessions: make(map[string]session), loginFailures: make(map[string]loginAttempts),
 	}
 	go s.runBlobGC()
-	go s.runPushOutbox()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/auth/status", s.handleAuthStatus)
 	mux.HandleFunc("/api/auth/login", s.handleLogin)
 	mux.HandleFunc("/api/auth/logout", s.handleLogout)
 	mux.HandleFunc("/api/notifications/settings", s.handleNotificationSettings)
-	mux.HandleFunc("/api/notifications/test", s.handleNotificationTest)
-	mux.HandleFunc("/api/notifications/push/key", s.handlePushVAPIDKey)
-	mux.HandleFunc("/api/notifications/push/subscription", s.handlePushSubscription)
-	mux.HandleFunc("/api/notifications/push/test", s.handlePushTest)
 	mux.HandleFunc("/api/artifacts", s.handleArtifactRoutes)
 	mux.HandleFunc("/api/artifacts/", s.handleArtifactRoutes)
 	mux.HandleFunc("/api/builds", s.handleBuildCollection)
@@ -197,33 +190,9 @@ func schema(db *sql.DB) {
 		sent_at TEXT NOT NULL DEFAULT '',
 		UNIQUE(build_id,event)
 	); CREATE INDEX IF NOT EXISTS email_outbox_due ON email_outbox(status,next_attempt_at,id);
-	CREATE TABLE IF NOT EXISTS push_subscriptions (
-		endpoint TEXT PRIMARY KEY,
-		owner_id TEXT NOT NULL,
-		subscription TEXT NOT NULL,
-		created_at TEXT NOT NULL,
-		updated_at TEXT NOT NULL
-	); CREATE INDEX IF NOT EXISTS push_subscriptions_owner ON push_subscriptions(owner_id);
-	CREATE TABLE IF NOT EXISTS push_outbox (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		build_id TEXT NOT NULL,
-		event TEXT NOT NULL,
-		endpoint TEXT NOT NULL,
-		subscription TEXT NOT NULL,
-		payload TEXT NOT NULL,
-		status TEXT NOT NULL DEFAULT 'pending',
-		attempts INTEGER NOT NULL DEFAULT 0,
-		next_attempt_at TEXT NOT NULL,
-		last_error TEXT NOT NULL DEFAULT '',
-		created_at TEXT NOT NULL,
-		sent_at TEXT NOT NULL DEFAULT '',
-		UNIQUE(build_id,event,endpoint)
-	); CREATE INDEX IF NOT EXISTS push_outbox_due ON push_outbox(status,next_attempt_at,id);
-	CREATE TABLE IF NOT EXISTS webpush_keys (
-		id INTEGER PRIMARY KEY CHECK(id=1),
-		public_key TEXT NOT NULL,
-		private_key TEXT NOT NULL
-	)`); err != nil {
+	DROP TABLE IF EXISTS push_outbox;
+	DROP TABLE IF EXISTS push_subscriptions;
+	DROP TABLE IF EXISTS webpush_keys`); err != nil {
 		log.Fatal(err)
 	}
 	var projectIDColumn int
@@ -298,7 +267,7 @@ func defaultConfig() AppConfig {
 	return AppConfig{
 		Mode: "public", Port: 8866, SessionTTLHours: 168, SecureCookie: true,
 		Build: BuildConfig{MaxUploadMB: 50, TimeoutMinutes: 30, MemoryMB: 4096, CPUs: 2, Parallel: 1},
-		SMTP:  SMTPConfig{Port: 587}, VAPIDSubject: vapidSubscriber,
+		SMTP:  SMTPConfig{Port: 587},
 	}
 }
 
@@ -346,16 +315,6 @@ func loadConfig(path string) (AppConfig, error) {
 	}
 	if config.SMTP.Port < 0 || config.SMTP.Port > 65535 {
 		return config, errors.New("IDE.config smtp port must be 0 or between 1 and 65535")
-	}
-	if config.VAPIDSubject == "" {
-		config.VAPIDSubject = vapidSubscriber
-	}
-	subject, err := url.Parse(config.VAPIDSubject)
-	if err != nil || strings.ContainsAny(config.VAPIDSubject, "\r\n") ||
-		(subject.Scheme != "mailto" && subject.Scheme != "https") ||
-		(subject.Scheme == "mailto" && subject.Opaque == "") ||
-		(subject.Scheme == "https" && subject.Hostname() == "") {
-		return config, errors.New("IDE.config vapidSubject must be a mailto: or HTTPS URL")
 	}
 	if err := os.Chmod(path, 0600); err != nil {
 		return config, err

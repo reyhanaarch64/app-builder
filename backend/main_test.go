@@ -59,28 +59,6 @@ func TestNotificationSettingsArePrivateAndDoNotExposeSMTPSecret(t *testing.T) {
 	}
 }
 
-func TestNotificationTestRequiresSavedRecipientAndSMTP(t *testing.T) {
-	db := testDB(t)
-	server := &Server{db: db, config: AppConfig{Mode: "private"}}
-	if _, err := db.Exec(`UPDATE notification_settings SET recipient='receiver@example.test' WHERE id=1`); err != nil {
-		t.Fatal(err)
-	}
-	response := httptest.NewRecorder()
-	server.handleNotificationTest(response, httptest.NewRequest(http.MethodPost, "/api/notifications/test", nil))
-	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "SMTP belum dikonfigurasi") {
-		t.Fatalf("test email without SMTP returned %d: %s", response.Code, response.Body.String())
-	}
-
-	if _, err := db.Exec(`UPDATE notification_settings SET recipient='' WHERE id=1`); err != nil {
-		t.Fatal(err)
-	}
-	response = httptest.NewRecorder()
-	server.handleNotificationTest(response, httptest.NewRequest(http.MethodPost, "/api/notifications/test", nil))
-	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "email penerima") {
-		t.Fatalf("test email without recipient returned %d: %s", response.Code, response.Body.String())
-	}
-}
-
 func TestBuildNotificationQueueRespectsSettingsAndDeduplicates(t *testing.T) {
 	db := testDB(t)
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -385,8 +363,7 @@ func TestLoadConfigCreatesPrivateDefaultFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.Mode != "public" || config.Port != 8866 || config.Build.Parallel != 1 ||
-		config.VAPIDSubject != vapidSubscriber {
+	if config.Mode != "public" || config.Port != 8866 || config.Build.Parallel != 1 {
 		t.Fatalf("unexpected default config: %+v", config)
 	}
 	info, err := os.Stat(path)
@@ -398,6 +375,26 @@ func TestLoadConfigCreatesPrivateDefaultFile(t *testing.T) {
 	}
 }
 
+func TestSchemaRemovesLegacyBrowserPushTables(t *testing.T) {
+	db := testDB(t)
+	for _, table := range []string{"push_subscriptions", "push_outbox", "webpush_keys"} {
+		if _, err := db.Exec("CREATE TABLE " + table + " (id INTEGER PRIMARY KEY)"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	schema(db)
+
+	var remaining int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+		WHERE type='table' AND name IN ('push_subscriptions','push_outbox','webpush_keys')`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("schema retained %d legacy browser push tables", remaining)
+	}
+}
+
 func TestLoadConfigRejectsPrivateModeWithoutPassword(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "IDE.config")
 	content := `{"mode":"private","password":"","port":8866,"sessionTTLHours":168,"secureCookie":true,"build":{"maxUploadMB":50,"timeoutMinutes":30,"memoryMB":4096,"cpus":2,"parallel":1}}`
@@ -406,22 +403,6 @@ func TestLoadConfigRejectsPrivateModeWithoutPassword(t *testing.T) {
 	}
 	if _, err := loadConfig(path); err == nil || !strings.Contains(err.Error(), "password") {
 		t.Fatalf("expected private password validation error, got %v", err)
-	}
-}
-
-func TestLoadConfigRejectsInvalidVAPIDSubject(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "IDE.config")
-	config := defaultConfig()
-	config.VAPIDSubject = "javascript:alert(1)"
-	content, err := json.Marshal(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, content, 0600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := loadConfig(path); err == nil || !strings.Contains(err.Error(), "vapidSubject") {
-		t.Fatalf("expected invalid VAPID subject error, got %v", err)
 	}
 }
 

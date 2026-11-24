@@ -21,46 +21,6 @@ self.addEventListener('activate', event => {
   )
 })
 
-self.addEventListener('push', event => {
-  let payload = {}
-  try {
-    payload = event.data ? event.data.json() : {}
-  } catch {
-    payload = { body: event.data?.text() ?? '' }
-  }
-  const title = typeof payload.title === 'string' ? payload.title : 'App Builder'
-  const body = typeof payload.body === 'string' ? payload.body : 'status build diperbarui.'
-  const tag = typeof payload.tag === 'string' ? payload.tag : 'build-notification'
-  event.waitUntil(self.registration.showNotification(title, {
-    body,
-    tag,
-    icon: '/icons/app-192.png',
-    badge: '/icons/app-192.png',
-    data: { url: typeof payload.url === 'string' ? payload.url : '/' },
-  }))
-})
-
-self.addEventListener('notificationclick', event => {
-  event.notification.close()
-  event.waitUntil((async () => {
-    let target = new URL('/', self.location.origin)
-    try {
-      const requested = new URL(event.notification.data?.url ?? '/', self.location.origin)
-      if (requested.origin === self.location.origin && requested.pathname.startsWith('/')) target = requested
-    } catch {
-      target = new URL('/', self.location.origin)
-    }
-    const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true })
-    for (const client of windows) {
-      if (new URL(client.url).origin === self.location.origin) {
-        await client.navigate(target.href)
-        return client.focus()
-      }
-    }
-    return self.clients.openWindow(target.href)
-  })())
-})
-
 self.addEventListener('fetch', event => {
   const { request } = event
   if (request.method !== 'GET') return

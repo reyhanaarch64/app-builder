@@ -79,37 +79,6 @@ func (s *Server) handleNotificationSettings(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-func (s *Server) handleNotificationTest(w http.ResponseWriter, r *http.Request) {
-	if s.config.Mode != "private" {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "email notification settings require private mode"})
-		return
-	}
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-		return
-	}
-	settings, err := s.readNotificationSettings()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "gagal membaca email penerima"})
-		return
-	}
-	if settings.Recipient == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "isi email penerima terlebih dahulu"})
-		return
-	}
-	if !s.smtpConfigured() {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "SMTP belum dikonfigurasi di data/IDE.config"})
-		return
-	}
-	body := fmt.Sprintf("Ini email percobaan dari App Builder.\n\nWaktu: %s\n", time.Now().UTC().Format(time.RFC3339))
-	if err := sendSMTPMessage(s.config.SMTP, settings.Recipient, "[App Builder] test email", body); err != nil {
-		log.Printf("test email delivery failed: %v", err)
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "pengiriman email test gagal: " + err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]bool{"sent": true})
-}
-
 func (s *Server) readNotificationSettings() (notificationSettings, error) {
 	var settings notificationSettings
 	err := s.db.QueryRow(`SELECT recipient,notify_success,notify_failure
@@ -136,7 +105,6 @@ func (s *Server) enqueueBuildNotification(buildID, status string) {
 	if status != "success" && status != "failed" {
 		return
 	}
-	s.enqueueBuildPushNotifications(buildID, status)
 	settings, err := s.readNotificationSettings()
 	if err != nil {
 		log.Printf("failed to read build notification settings for %s: %v", buildID, err)

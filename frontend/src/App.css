@@ -3,6 +3,8 @@
 .topbar { grid-column:1/-1; display:flex; align-items:center; gap:12px; padding:0 12px; background:#10151b; border-bottom:1px solid var(--line); z-index:20; }
 .brand { display:flex; align-items:center; gap:8px; font-weight:700; letter-spacing:.2px; margin-right:auto; }
 .brand-mark { width:34px; height:34px; display:grid; place-items:center; border-radius:9px; color:#08130f; background:var(--accent); }
+.exit-project-btn { height:34px; display:flex; align-items:center; gap:5px; border:1px solid var(--line); border-radius:8px; background:#151b23; color:#c8d3df; padding:0 9px; font-size:12px; }
+.exit-project-btn:hover { border-color:#465463; color:#fff; }
 .project-title { color:var(--muted); font-size:13px; border-left:1px solid var(--line); padding-left:14px; }
 .offline-indicator { display:flex; align-items:center; gap:5px; color:#e8b66a; font-size:11px; white-space:nowrap; }
 .install-btn { height:36px; display:flex; align-items:center; gap:6px; border:1px solid var(--line); border-radius:8px; background:#151b23; color:#c8d3df; padding:0 10px; font-size:12px; }
@@ -114,12 +116,7 @@ small { color:var(--muted); font-size:10px; font-weight:800; letter-spacing:1.3p
 .notification-options span { display:flex; flex-direction:column; gap:3px; }
 .notification-options strong { color:#dce5ef; font-size:12px; }
 .notification-options small { color:#8491a2; font-size:10px; font-weight:400; letter-spacing:0; }
-.push-settings { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:12px 0; padding:12px; border:1px solid var(--line); border-radius:8px; background:#10151b; }
-.push-settings > div:first-child { display:flex; flex-direction:column; gap:4px; }
-.push-settings strong { color:#dce5ef; font-size:12px; }
-.push-settings small { color:#8491a2; font-size:10px; font-weight:400; letter-spacing:0; }
-.push-actions { display:flex; gap:6px; flex:none; }
-.notification-actions { display:flex; justify-content:space-between; gap:8px; margin-top:14px; }
+.notification-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:14px; }
 .notification-actions .primary-btn { min-width:90px; }
 .danger-btn { min-height:38px; border:1px solid #773c43; border-radius:8px; background:#5a282e; color:#ffe2e2; padding:0 12px; font-weight:700; font-size:11px; }
 .danger-btn:hover { background:#773139; }
@@ -157,6 +154,8 @@ small { color:var(--muted); font-size:10px; font-weight:800; letter-spacing:1.3p
   .app-shell { grid-template-columns:0 1fr; }
   .topbar { gap:6px; }
   .brand span { display:none; }
+  .exit-project-btn { width:34px; justify-content:center; padding:0; }
+  .exit-project-btn span { display:none; }
   .project-title { display:none; }
   .build-btn { margin-left:auto; }
   .build-btn span { display:none; }

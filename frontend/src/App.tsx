@@ -3,7 +3,7 @@ import Editor from '@monaco-editor/react'
 import Dexie, { type Table } from 'dexie'
 import JSZip from 'jszip'
 import {
-  Archive, Ban, Bell, Box, ChevronRight, Copy, Download, FileCode2, FilePlus2, FolderPlus, HardDrive,
+  Archive, ArrowLeft, Ban, Box, ChevronRight, Copy, Download, FileCode2, FilePlus2, FolderPlus, HardDrive, Mail,
   LogOut, Menu, PackagePlus, Play, RefreshCw, Search, Smartphone, Trash2, Upload, WifiOff,
   X,
 } from 'lucide-react'
@@ -78,7 +78,6 @@ type NotificationSettings = {
   notifyFailure: boolean
   smtpConfigured: boolean
 }
-type PushSubscriptionStatus = { subscribed: boolean }
 type InstallPromptEvent = Event & {
   prompt: () => Promise<void>
   userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>
@@ -238,29 +237,11 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(1)} ${units[unit]}`
 }
 
-function decodeVapidPublicKey(key: string): ArrayBuffer {
-  const base64 = key.replace(/-/g, '+').replace(/_/g, '/')
-  const raw = atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, '='))
-  const bytes = new Uint8Array(new ArrayBuffer(raw.length))
-  for (let index = 0; index < raw.length; index++) bytes[index] = raw.charCodeAt(index)
-  return bytes.buffer
-}
-
 function throwIfBuildAborted(signal: AbortSignal) {
   if (!signal.aborted) return
   const error = new Error('Build dibatalkan')
   error.name = 'AbortError'
   throw error
-}
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  let timeoutId: number | undefined
-  const timeout = new Promise<T>((_, reject) => {
-    timeoutId = window.setTimeout(() => reject(new Error(message)), timeoutMs)
-  })
-  return Promise.race([promise, timeout]).finally(() => {
-    if (timeoutId !== undefined) window.clearTimeout(timeoutId)
-  })
 }
 
 async function createBuildManifest(files: ProjectFile[], signal: AbortSignal): Promise<ManifestFile[]> {
@@ -354,13 +335,7 @@ function App() {
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings | null>(null)
   const [notificationLoading, setNotificationLoading] = useState(false)
   const [notificationSaving, setNotificationSaving] = useState(false)
-  const [notificationTesting, setNotificationTesting] = useState(false)
   const [notificationError, setNotificationError] = useState('')
-  const [pushSubscribed, setPushSubscribed] = useState(false)
-  const [pushPermission, setPushPermission] = useState<NotificationPermission>('default')
-  const [pushServiceWorkerReady, setPushServiceWorkerReady] = useState(false)
-  const [pushStage, setPushStage] = useState<'idle' | 'permission' | 'key' | 'worker' | 'subscribe' | 'saving'>('idle')
-  const [pushBusy, setPushBusy] = useState(false)
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null)
   const [loginPassword, setLoginPassword] = useState('')
   const [loginError, setLoginError] = useState('')
@@ -676,6 +651,13 @@ function App() {
       return
     }
     setStorageOpen(true)
+  }
+
+  function exitProject() {
+    setActiveProjectId(null)
+    setDrawerOpen(false)
+    setSearch('')
+    setBuildOpen(false)
   }
 
   async function loadArtifacts() {
@@ -1137,166 +1119,14 @@ function App() {
     setNotificationLoading(true)
     setNotificationError('')
     try {
-      const [settingsResponse, pushResponse] = await Promise.all([
-        fetch('/api/notifications/settings'),
-        fetch('/api/notifications/push/subscription'),
-      ])
+      const settingsResponse = await fetch('/api/notifications/settings')
       const settings = await settingsResponse.json() as NotificationSettings & { error?: string }
       if (!settingsResponse.ok) throw new Error(settings.error || 'gagal membaca pengaturan email')
-      const pushStatus = await pushResponse.json() as PushSubscriptionStatus & { error?: string }
-      if (!pushResponse.ok) throw new Error(pushStatus.error || 'gagal membaca status browser notification')
       setNotificationSettings(settings)
-      const supported = window.isSecureContext &&
-        'Notification' in window && 'PushManager' in window && 'serviceWorker' in navigator
-      setPushPermission(supported ? Notification.permission : 'denied')
-      setPushServiceWorkerReady(false)
-      if (supported) {
-        const registration = await navigator.serviceWorker.getRegistration()
-        if (registration?.active) {
-          setPushServiceWorkerReady(true)
-          const subscription = await registration.pushManager.getSubscription()
-          if (subscription && !pushStatus.subscribed) {
-            const saveResponse = await fetch('/api/notifications/push/subscription', {
-              method: 'PUT',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(subscription.toJSON()),
-            })
-            if (!saveResponse.ok) throw new Error('gagal menyimpan browser notification')
-          } else if (!subscription && pushStatus.subscribed) {
-            await fetch('/api/notifications/push/subscription', {
-              method: 'DELETE',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ endpoint: '' }),
-            })
-          }
-          setPushSubscribed(Boolean(subscription))
-        } else {
-          setPushSubscribed(false)
-        }
-      } else {
-        setPushSubscribed(false)
-      }
     } catch (error) {
       setNotificationError(error instanceof Error ? error.message : 'gagal membaca pengaturan notifikasi')
     } finally {
       setNotificationLoading(false)
-    }
-  }
-
-  async function enablePushNotifications() {
-    if (!window.isSecureContext) {
-      setNotificationError('browser push butuh HTTPS; buka IDE lewat alamat HTTPS yang valid')
-      return
-    }
-    if (!('Notification' in window) || !('PushManager' in window) || !('serviceWorker' in navigator)) {
-      setNotificationError('browser ini belum mendukung browser push notification')
-      return
-    }
-    setPushBusy(true)
-    setNotificationError('')
-    try {
-      setPushStage('permission')
-      const permission = Notification.permission === 'default'
-        ? await withTimeout(
-          Promise.resolve(Notification.requestPermission()),
-          30000,
-          'permintaan izin notifikasi belum dijawab dalam 30 detik',
-        )
-        : Notification.permission
-      setPushPermission(permission)
-      if (permission !== 'granted') throw new Error('izin notifikasi browser tidak diberikan')
-      setPushStage('key')
-      const keyResponse = await fetch('/api/notifications/push/key', { signal: AbortSignal.timeout(15000) })
-      const keyData = await keyResponse.json() as { publicKey?: string; error?: string }
-      if (!keyResponse.ok || !keyData.publicKey) throw new Error(keyData.error || 'gagal mengambil kunci browser notification')
-      setPushStage('worker')
-      const currentRegistration = await navigator.serviceWorker.getRegistration()
-      const registration = currentRegistration?.active
-        ? currentRegistration
-        : await withTimeout(
-          navigator.serviceWorker.ready,
-          15000,
-          'service worker belum aktif setelah 15 detik; refresh halaman lalu coba lagi',
-        )
-      setPushServiceWorkerReady(true)
-      setPushStage('subscribe')
-      let subscription = await registration.pushManager.getSubscription()
-      if (!subscription) {
-        const subscribePromise = registration.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: decodeVapidPublicKey(keyData.publicKey),
-        })
-        try {
-          subscription = await withTimeout(
-            subscribePromise,
-            30000,
-            'Chrome belum menyelesaikan pendaftaran push dalam 30 detik',
-          )
-        } catch (error) {
-          if (error instanceof Error && error.message === 'Chrome belum menyelesaikan pendaftaran push dalam 30 detik') {
-            void subscribePromise.then(lateSubscription => lateSubscription.unsubscribe()).catch(() => undefined)
-          }
-          throw error
-        }
-      }
-      setPushStage('saving')
-      const response = await fetch('/api/notifications/push/subscription', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        signal: AbortSignal.timeout(15000),
-        body: JSON.stringify(subscription.toJSON()),
-      })
-      const data = await response.json() as { error?: string }
-      if (!response.ok) {
-        await subscription.unsubscribe()
-        throw new Error(data.error || 'gagal mengaktifkan browser notification')
-      }
-      setPushSubscribed(true)
-      setToast('browser notification aktif')
-    } catch (error) {
-      setNotificationError(error instanceof Error ? error.message : 'gagal mengaktifkan browser notification')
-    } finally {
-      setPushStage('idle')
-      setPushBusy(false)
-    }
-  }
-
-  async function disablePushNotifications() {
-    setPushBusy(true)
-    setNotificationError('')
-    try {
-      const registration = await navigator.serviceWorker.getRegistration()
-      if (!registration?.active) throw new Error('service worker belum aktif; refresh halaman lalu coba lagi')
-      const subscription = await registration.pushManager.getSubscription()
-      const response = await fetch('/api/notifications/push/subscription', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ endpoint: subscription?.endpoint ?? '' }),
-      })
-      const data = await response.json() as { error?: string }
-      if (!response.ok) throw new Error(data.error || 'gagal menonaktifkan browser notification')
-      if (subscription) await subscription.unsubscribe()
-      setPushSubscribed(false)
-      setToast('browser notification dinonaktifkan')
-    } catch (error) {
-      setNotificationError(error instanceof Error ? error.message : 'gagal menonaktifkan browser notification')
-    } finally {
-      setPushBusy(false)
-    }
-  }
-
-  async function sendTestPushNotification() {
-    setPushBusy(true)
-    setNotificationError('')
-    try {
-      const response = await fetch('/api/notifications/push/test', { method: 'POST' })
-      const data = await response.json() as { error?: string }
-      if (!response.ok) throw new Error(data.error || 'browser notification test gagal dikirim')
-      setToast('browser notification test dikirim')
-    } catch (error) {
-      setNotificationError(error instanceof Error ? error.message : 'browser notification test gagal dikirim')
-    } finally {
-      setPushBusy(false)
     }
   }
 
@@ -1323,34 +1153,6 @@ function App() {
       setNotificationError(error instanceof Error ? error.message : 'gagal menyimpan pengaturan email')
     } finally {
       setNotificationSaving(false)
-    }
-  }
-
-  async function sendTestNotification() {
-    if (!notificationSettings) return
-    setNotificationTesting(true)
-    setNotificationError('')
-    try {
-      const saveResponse = await fetch('/api/notifications/settings', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          recipient: notificationSettings.recipient,
-          notifySuccess: notificationSettings.notifySuccess,
-          notifyFailure: notificationSettings.notifyFailure,
-        }),
-      })
-      const saved = await saveResponse.json() as NotificationSettings & { error?: string }
-      if (!saveResponse.ok) throw new Error(saved.error || 'gagal menyimpan pengaturan email')
-      setNotificationSettings(saved)
-      const response = await fetch('/api/notifications/test', { method: 'POST' })
-      const data = await response.json() as { error?: string }
-      if (!response.ok) throw new Error(data.error || 'email test gagal dikirim')
-      setToast('email test berhasil dikirim')
-    } catch (error) {
-      setNotificationError(error instanceof Error ? error.message : 'email test gagal dikirim')
-    } finally {
-      setNotificationTesting(false)
     }
   }
 
@@ -1402,6 +1204,7 @@ function App() {
       <header className="topbar">
         <button className="icon-btn" onClick={() => setDrawerOpen(v => !v)}><Menu size={20}/></button>
         <div className="brand"><div className="brand-mark"><Box size={18}/></div><span>Droid Studio</span></div>
+        {activeProject && <button className="exit-project-btn" title="Keluar dari project" aria-label="Keluar dari project" onClick={exitProject}><ArrowLeft size={17}/><span>Projects</span></button>}
         {activeProject && <div className="project-title">{activeProject.name}</div>}
         {!onlineAccess && <div className="offline-indicator"><WifiOff size={14}/><span>offline · edit lokal</span></div>}
         {!isInstalled && <button className="install-btn" title="Install Android Web IDE" onClick={() => void installApp()}><Smartphone size={16}/><span>Install</span></button>}
@@ -1409,7 +1212,7 @@ function App() {
           <Play size={16} fill="currentColor"/><span>{!onlineAccess ? 'Offline' : buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building' ? 'Building...' : 'Build APK'}</span>
         </button>
         <button className="icon-btn" title={onlineAccess ? 'APK tersimpan' : 'Perlu koneksi ke server'} onClick={openArtifacts} disabled={!onlineAccess}><Archive size={18}/></button>
-        {authMode === 'private' && <button className="icon-btn" title={onlineAccess ? 'Notifikasi build' : 'Perlu koneksi ke server'} onClick={() => void openNotifications()} disabled={!onlineAccess}><Bell size={18}/></button>}
+        {authMode === 'private' && <button className="icon-btn" title={onlineAccess ? 'Notifikasi email build' : 'Perlu koneksi ke server'} onClick={() => void openNotifications()} disabled={!onlineAccess}><Mail size={18}/></button>}
         <button className="icon-btn storage-btn" title={onlineAccess ? 'Kelola storage build' : 'Perlu koneksi ke server'} onClick={openStorage} disabled={!onlineAccess}><HardDrive size={18}/></button>
         {authMode === 'private' && <button className="icon-btn" title="Logout" onClick={logout}><LogOut size={18}/></button>}
       </header>
@@ -1546,19 +1349,9 @@ function App() {
           settings={notificationSettings}
           loading={notificationLoading}
           saving={notificationSaving}
-          testing={notificationTesting}
-          pushBusy={pushBusy}
-          pushSupported={window.isSecureContext && 'Notification' in window && 'PushManager' in window && 'serviceWorker' in navigator}
-          pushSubscribed={pushSubscribed}
-          pushPermission={pushPermission}
-          pushServiceWorkerReady={pushServiceWorkerReady}
-          pushStage={pushStage}
           error={notificationError}
           onSettingsChange={setNotificationSettings}
           onSave={saveNotificationSettings}
-          onTest={() => void sendTestNotification()}
-          onPushToggle={() => void (pushSubscribed ? disablePushNotifications() : enablePushNotifications())}
-          onPushTest={() => void sendTestPushNotification()}
           onClose={() => setNotificationsOpen(false)}
         />
       )}
@@ -1567,32 +1360,21 @@ function App() {
   )
 }
 
-function NotificationDialog({ settings, loading, saving, testing, pushBusy, pushSupported, pushSubscribed,
-  pushPermission, pushServiceWorkerReady, pushStage, error, onSettingsChange, onSave, onTest, onPushToggle, onPushTest, onClose }: {
+function NotificationDialog({ settings, loading, saving, error, onSettingsChange, onSave, onClose }: {
   settings: NotificationSettings | null
   loading: boolean
   saving: boolean
-  testing: boolean
-  pushBusy: boolean
-  pushSupported: boolean
-  pushSubscribed: boolean
-  pushPermission: NotificationPermission
-  pushServiceWorkerReady: boolean
-  pushStage: 'idle' | 'permission' | 'key' | 'worker' | 'subscribe' | 'saving'
   error: string
   onSettingsChange: (settings: NotificationSettings | null) => void
   onSave: (event: FormEvent<HTMLFormElement>) => void
-  onTest: () => void
-  onPushToggle: () => void
-  onPushTest: () => void
   onClose: () => void
 }) {
-  const busy = loading || saving || testing || pushBusy
+  const busy = loading || saving
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <form className="modal notification-modal" onMouseDown={event => event.stopPropagation()} onSubmit={onSave}>
         <div className="modal-head">
-          <div><small>BUILD NOTIFICATIONS</small><h2>Notifikasi build</h2></div>
+          <div><small>BUILD EMAIL</small><h2>Notifikasi email build</h2></div>
           <button type="button" className="icon-btn" onClick={onClose}><X size={18}/></button>
         </div>
         {loading ? <p className="notification-info">memuat pengaturan…</p> : settings && (
@@ -1615,47 +1397,10 @@ function NotificationDialog({ settings, loading, saving, testing, pushBusy, push
                 onChange={event => onSettingsChange({ ...settings, notifyFailure: event.target.checked })}/>
                 <span><strong>Build gagal</strong><small>kirim notifikasi saat build gagal</small></span></label>
             </div>
-            <section className="push-settings">
-              <div><strong>Browser push</strong>
-                <small>{!window.isSecureContext
-                  ? 'browser push butuh HTTPS dan sertifikat yang valid'
-                  : !pushSupported
-                  ? 'browser ini belum mendukung push notification'
-                  : pushPermission === 'denied'
-                    ? 'izin notifikasi diblokir di pengaturan browser'
-                    : !pushServiceWorkerReady
-                      ? 'service worker belum aktif; tombol aktifkan akan mencoba lagi'
-                      : pushSubscribed ? 'browser ini siap menerima notifikasi build'
-                        : 'notifikasi bisa diterima saat IDE tidak sedang dibuka'}</small>
-              </div>
-              <div className="push-actions">
-                <button type="button" className="tool-btn refresh-storage" onClick={onPushToggle}
-                  disabled={busy || !pushSupported || pushPermission === 'denied'}>
-                  {pushBusy
-                    ? pushStage === 'idle' ? 'memproses…'
-                      : ({ permission: 'minta izin…', key: 'ambil key…', worker: 'menunggu worker…',
-                        subscribe: 'daftar push…', saving: 'menyimpan…' }[pushStage])
-                    : pushSubscribed ? 'nonaktifkan' : 'aktifkan'}
-                </button>
-                <button type="button" className="tool-btn refresh-storage" onClick={onPushTest}
-                  disabled={busy || !pushSubscribed}>
-                  kirim test
-                </button>
-              </div>
-            </section>
-            <div className="notification-info not-configured">
-              {settings.smtpConfigured
-                ? 'email juga aktif; kredensial pengirim disimpan di data/IDE.config.'
-                : 'email opsional: isi smtp di data/IDE.config untuk mengaktifkannya.'}
-            </div>
           </>
         )}
         {error && <div className="login-error">{error}</div>}
         <div className="notification-actions">
-          <button type="button" className="tool-btn refresh-storage" onClick={onTest}
-            disabled={busy || !settings?.smtpConfigured || !settings.recipient}>
-            {testing ? 'mengirim…' : 'kirim email test'}
-          </button>
           <button type="submit" className="primary-btn" disabled={busy || !settings}>
             {saving ? 'menyimpan…' : 'simpan'}
           </button>
