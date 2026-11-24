@@ -611,6 +611,17 @@ func (s *Server) releaseAllBuildBlobRefs() error {
 	return tx.Commit()
 }
 
+func releaseBuildBlobRefsTx(tx *sql.Tx, buildID string) error {
+	if _, err := tx.Exec(`UPDATE blobs SET ref_count=ref_count-(SELECT COUNT(*) FROM build_blob_refs r
+		WHERE r.build_id=? AND r.owner_id=blobs.owner_id AND r.sha256=blobs.sha256 AND r.counted=1)
+		WHERE EXISTS (SELECT 1 FROM build_blob_refs r WHERE r.build_id=? AND r.owner_id=blobs.owner_id
+		AND r.sha256=blobs.sha256 AND r.counted=1)`, buildID, buildID); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`DELETE FROM build_blob_refs WHERE build_id=?`, buildID)
+	return err
+}
+
 func (s *Server) runBlobGC() {
 	ticker := time.NewTicker(15 * time.Minute)
 	defer ticker.Stop()

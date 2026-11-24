@@ -83,6 +83,7 @@ type Server struct {
 	buildMu       sync.Mutex
 	maintenanceMu sync.Mutex
 	building      map[string]bool
+	buildCancels  map[string]context.CancelFunc
 	startBuildFn  func(string, string)
 	ownerMu       sync.Mutex
 	sessionMu     sync.Mutex
@@ -134,6 +135,8 @@ func main() {
 	mux.HandleFunc("/api/notifications/push/key", s.handlePushVAPIDKey)
 	mux.HandleFunc("/api/notifications/push/subscription", s.handlePushSubscription)
 	mux.HandleFunc("/api/notifications/push/test", s.handlePushTest)
+	mux.HandleFunc("/api/artifacts", s.handleArtifactRoutes)
+	mux.HandleFunc("/api/artifacts/", s.handleArtifactRoutes)
 	mux.HandleFunc("/api/builds", s.handleBuildCollection)
 	mux.HandleFunc("/api/builds/prepare", s.handleBuildPrepare)
 	mux.HandleFunc("/api/builds/", s.handleBuildRoutes)
@@ -1031,36 +1034,74 @@ func (s *Server) handleBuildRoutes(w http.ResponseWriter, r *http.Request) {
 	case "":
 		if r.Method == http.MethodDelete {
 			s.maintenanceMu.Lock()
-			defer s.maintenanceMu.Unlock()
-			if _, err := s.getBuildForOwner(ownerID, id); err != nil {
+			build, err := s.getBuildForOwner(ownerID, id)
+			if err != nil {
+				s.maintenanceMu.Unlock()
 				http.NotFound(w, r)
+				return
+			}
+			if build.Status == "canceled" {
+				s.maintenanceMu.Unlock()
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			if build.Status != "preparing" && build.Status != "assembling" &&
+				build.Status != "queued" && build.Status != "building" {
+				s.maintenanceMu.Unlock()
+				http.Error(w, "build sudah selesai dan tidak bisa dibatalkan", http.StatusConflict)
 				return
 			}
 			now := time.Now().UTC().Format(time.RFC3339)
 			tx, err := s.db.Begin()
 			if err != nil {
+				s.maintenanceMu.Unlock()
 				http.Error(w, "gagal membatalkan build", http.StatusInternalServerError)
 				return
 			}
-			if _, err := tx.Exec(`UPDATE builds SET status='canceled',finished_at=?,updated_at=? WHERE id=? AND owner_id=?`,
-				now, now, id, ownerID); err != nil {
+			result, err := tx.Exec(`UPDATE builds SET status='canceled',finished_at=?,updated_at=?
+				WHERE id=? AND owner_id=? AND status IN ('preparing','assembling','queued','building')`,
+				now, now, id, ownerID)
+			if err != nil {
 				tx.Rollback()
+				s.maintenanceMu.Unlock()
 				http.Error(w, "gagal membatalkan build", http.StatusInternalServerError)
+				return
+			}
+			changed, err := result.RowsAffected()
+			if err != nil || changed == 0 {
+				tx.Rollback()
+				s.maintenanceMu.Unlock()
+				http.Error(w, "build sudah selesai dan tidak bisa dibatalkan", http.StatusConflict)
 				return
 			}
 			if _, err := tx.Exec(`DELETE FROM build_manifests WHERE build_id=?`, id); err != nil {
 				tx.Rollback()
+				s.maintenanceMu.Unlock()
 				http.Error(w, "build dibatalkan, tetapi manifest gagal dihapus", http.StatusInternalServerError)
 				return
 			}
 			if _, err := tx.Exec(`DELETE FROM blob_reservations WHERE build_id=?`, id); err != nil {
 				tx.Rollback()
+				s.maintenanceMu.Unlock()
 				http.Error(w, "build dibatalkan, tetapi reservasi binary gagal dihapus", http.StatusInternalServerError)
 				return
 			}
+			if err := releaseBuildBlobRefsTx(tx, id); err != nil {
+				tx.Rollback()
+				s.maintenanceMu.Unlock()
+				http.Error(w, "build dibatalkan, tetapi referensi binary gagal dilepas", http.StatusInternalServerError)
+				return
+			}
 			if err := tx.Commit(); err != nil {
+				s.maintenanceMu.Unlock()
 				http.Error(w, "gagal menyelesaikan pembatalan build", http.StatusInternalServerError)
 				return
+			}
+			s.maintenanceMu.Unlock()
+			if !s.cancelRunningBuild(id) {
+				if err := os.RemoveAll(filepath.Join(s.dataDir, "workspaces", id)); err != nil {
+					log.Printf("failed to remove canceled build workspace %s: %v", id, err)
+				}
 			}
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -1259,13 +1300,6 @@ func (s *Server) runBuild(id, workspace string) {
 	s.buildMu.Unlock()
 	defer func() { s.buildMu.Lock(); delete(s.building, id); s.buildMu.Unlock() }()
 
-	s.buildSlots <- struct{}{}
-	defer func() { <-s.buildSlots }()
-
-	now := time.Now().UTC().Format(time.RFC3339)
-	s.db.Exec(`UPDATE builds SET status='building',started_at=? WHERE id=?`, now, id)
-	s.addLog(id, "system", "Menjalankan Docker build container")
-
 	projectRoot := workspace
 	if root, err := findProjectRoot(workspace); err == nil {
 		projectRoot = root
@@ -1281,16 +1315,66 @@ func (s *Server) runBuild(id, workspace string) {
 	hostProjectRoot := filepath.Join(s.hostDataDir, relativeRoot)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.config.Build.TimeoutMinutes)*time.Minute)
 	defer cancel()
+	s.buildMu.Lock()
+	if s.buildCancels == nil {
+		s.buildCancels = make(map[string]context.CancelFunc)
+	}
+	s.buildCancels[id] = cancel
+	s.buildMu.Unlock()
+	defer func() {
+		s.buildMu.Lock()
+		delete(s.buildCancels, id)
+		s.buildMu.Unlock()
+	}()
+	select {
+	case s.buildSlots <- struct{}{}:
+		defer func() { <-s.buildSlots }()
+	case <-ctx.Done():
+		if ctx.Err() == context.DeadlineExceeded {
+			s.failBuild(id, fmt.Sprintf("build timeout %d menit", s.config.Build.TimeoutMinutes))
+		}
+		return
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	result, err := s.db.Exec(`UPDATE builds SET status='building',started_at=? WHERE id=? AND status='queued'`, now, id)
+	if err != nil {
+		s.failBuild(id, "gagal memulai worker build")
+		return
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		s.failBuild(id, "gagal memulai worker build")
+		return
+	}
+	if changed == 0 {
+		return
+	}
+	s.addLog(id, "system", "Menjalankan Docker build container")
+	containerName := "android-ide-build-" + id
 	cmd := exec.CommandContext(ctx, "docker", "run", "--rm",
+		"--name", containerName,
 		fmt.Sprintf("--memory=%dm", s.config.Build.MemoryMB),
 		fmt.Sprintf("--cpus=%d", s.config.Build.CPUs), "--pids-limit=256",
 		"-v", hostProjectRoot+":/project",
 		"-v", "androidide_gradle:/root/.gradle",
 		androidBuilderImage(),
 		"/bin/bash", "-lc", "if [ -x ./gradlew ]; then ./gradlew --no-daemon assembleDebug; elif [ -f ./gradlew ]; then chmod +x ./gradlew && ./gradlew --no-daemon assembleDebug; else gradle --no-daemon assembleDebug; fi")
+	cmd.Cancel = func() error {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if err := exec.CommandContext(stopCtx, "docker", "stop", "--time", "2", containerName).Run(); err != nil {
+			return err
+		}
+		return os.ErrProcessDone
+	}
+	cmd.WaitDelay = 5 * time.Second
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 	if err := cmd.Start(); err != nil {
+		if ctx.Err() == context.Canceled {
+			return
+		}
 		s.failBuild(id, "gagal menjalankan Docker: "+err.Error())
 		return
 	}
@@ -1306,6 +1390,10 @@ func (s *Server) runBuild(id, workspace string) {
 	}()
 	err = cmd.Wait()
 	logWriters.Wait()
+	if ctx.Err() == context.Canceled {
+		s.addLog(id, "system", "Build dibatalkan")
+		return
+	}
 	if ctx.Err() == context.DeadlineExceeded {
 		s.failBuild(id, fmt.Sprintf("build timeout %d menit", s.config.Build.TimeoutMinutes))
 		return
@@ -1322,6 +1410,10 @@ func (s *Server) runBuild(id, workspace string) {
 	}
 	filename := id + ".apk"
 	artifact := filepath.Join(s.dataDir, "artifacts", filename)
+	if err := os.MkdirAll(filepath.Dir(artifact), 0750); err != nil {
+		s.failBuild(id, "gagal membuat direktori artifact")
+		return
+	}
 	input, _ := os.Open(apk)
 	output, err := os.Create(artifact)
 	if err != nil {
@@ -1331,13 +1423,37 @@ func (s *Server) runBuild(id, workspace string) {
 	io.Copy(output, input)
 	input.Close()
 	output.Close()
+	if ctx.Err() == context.Canceled {
+		os.Remove(artifact)
+		s.addLog(id, "system", "Build dibatalkan")
+		return
+	}
 	s.addLog(id, "system", "APK berhasil dibuild")
-	if _, err := s.db.Exec(`UPDATE builds SET status='success',finished_at=?,artifact=? WHERE id=?`,
-		time.Now().UTC().Format(time.RFC3339), filename, id); err != nil {
+	result, err = s.db.Exec(`UPDATE builds SET status='success',finished_at=?,artifact=?
+		WHERE id=? AND status='building'`,
+		time.Now().UTC().Format(time.RFC3339), filename, id)
+	if err != nil {
 		log.Printf("failed to save success status for build %s: %v", id, err)
+		os.Remove(artifact)
+		return
+	}
+	changed, err = result.RowsAffected()
+	if err != nil || changed == 0 {
+		os.Remove(artifact)
 		return
 	}
 	s.enqueueBuildNotification(id, "success")
+}
+
+func (s *Server) cancelRunningBuild(id string) bool {
+	s.buildMu.Lock()
+	cancel := s.buildCancels[id]
+	s.buildMu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
 }
 
 func (s *Server) copyLogs(id, stream string, r io.ReadCloser) {
@@ -1378,13 +1494,23 @@ func androidBuilderImage() string {
 }
 
 func (s *Server) failBuild(id, message string) {
-	s.addLog(id, "system", "Build gagal: "+message)
 	now := time.Now().UTC().Format(time.RFC3339)
-	if _, err := s.db.Exec(`UPDATE builds SET status='failed',finished_at=?,updated_at=?,error=? WHERE id=?`,
-		now, now, message, id); err != nil {
+	result, err := s.db.Exec(`UPDATE builds SET status='failed',finished_at=?,updated_at=?,error=?
+		WHERE id=? AND status IN ('preparing','assembling','queued','building')`,
+		now, now, message, id)
+	if err != nil {
 		log.Printf("failed to save failure status for build %s: %v", id, err)
 		return
 	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("failed to confirm failure status for build %s: %v", id, err)
+		return
+	}
+	if changed == 0 {
+		return
+	}
+	s.addLog(id, "system", "Build gagal: "+message)
 	s.enqueueBuildNotification(id, "failed")
 	s.db.Exec(`DELETE FROM build_manifests WHERE build_id=?`, id)
 	s.db.Exec(`DELETE FROM blob_reservations WHERE build_id=?`, id)

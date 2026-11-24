@@ -3,8 +3,8 @@ import Editor from '@monaco-editor/react'
 import Dexie, { type Table } from 'dexie'
 import JSZip from 'jszip'
 import {
-  Bell, Box, ChevronRight, Copy, Download, FileCode2, FilePlus2, FolderPlus, HardDrive,
-  LogOut, Menu, PackagePlus, Play, Search, Smartphone, Trash2, Upload, WifiOff,
+  Archive, Ban, Bell, Box, ChevronRight, Copy, Download, FileCode2, FilePlus2, FolderPlus, HardDrive,
+  LogOut, Menu, PackagePlus, Play, RefreshCw, Search, Smartphone, Trash2, Upload, WifiOff,
   X,
 } from 'lucide-react'
 import './App.css'
@@ -42,6 +42,16 @@ type Build = {
   createdAt: string
   error?: string
   artifact?: string
+}
+
+type APKArtifact = {
+  buildId: string
+  projectId: string
+  variant: string
+  createdAt: string
+  filename: string
+  size: number
+  available: boolean
 }
 
 type StorageStats = {
@@ -236,10 +246,18 @@ function decodeVapidPublicKey(key: string): ArrayBuffer {
   return bytes.buffer
 }
 
-async function createBuildManifest(files: ProjectFile[]): Promise<ManifestFile[]> {
+function throwIfBuildAborted(signal: AbortSignal) {
+  if (!signal.aborted) return
+  const error = new Error('Build dibatalkan')
+  error.name = 'AbortError'
+  throw error
+}
+
+async function createBuildManifest(files: ProjectFile[], signal: AbortSignal): Promise<ManifestFile[]> {
   const encoder = new TextEncoder()
   const manifest: ManifestFile[] = []
   for (const file of files) {
+    throwIfBuildAborted(signal)
     if (file.type !== 'file') continue
     const kind = file.binary ? 'binary' : 'text'
     const content = file.content ?? ''
@@ -247,14 +265,17 @@ async function createBuildManifest(files: ProjectFile[]): Promise<ManifestFile[]
     const cachedHash = file.sha256 === ''
       ? undefined
       : file.sha256 ?? (await db.files.get(file.id))?.sha256
+    throwIfBuildAborted(signal)
     let hash = cachedHash
     if (!hash) {
       const bytes = file.binary
         ? new Uint8Array(await file.binary.arrayBuffer())
         : encoder.encode(content)
+      throwIfBuildAborted(signal)
       hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)))
         .map(value => value.toString(16).padStart(2, '0')).join('')
     }
+    throwIfBuildAborted(signal)
     const updated = file.sha256 ? file : { ...file, sha256: hash }
     if (!cachedHash) await db.files.put(updated)
     manifest.push({
@@ -304,6 +325,7 @@ function App() {
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [buildOpen, setBuildOpen] = useState(false)
   const [buildStatus, setBuildStatus] = useState<Build['status'] | 'idle'>('idle')
+  const [buildCanceling, setBuildCanceling] = useState(false)
   const [logs, setLogs] = useState<string[]>([])
   const [buildId, setBuildId] = useState<string | null>(null)
   const [showCreate, setShowCreate] = useState(false)
@@ -313,6 +335,11 @@ function App() {
   const [storageOpen, setStorageOpen] = useState(false)
   const [storageLoading, setStorageLoading] = useState(false)
   const [storageStats, setStorageStats] = useState<StorageStats | null>(null)
+  const [artifactsOpen, setArtifactsOpen] = useState(false)
+  const [artifacts, setArtifacts] = useState<APKArtifact[]>([])
+  const [artifactsLoading, setArtifactsLoading] = useState(false)
+  const [artifactDeletingId, setArtifactDeletingId] = useState<string | null>(null)
+  const [artifactsError, setArtifactsError] = useState('')
   const [notificationsOpen, setNotificationsOpen] = useState(false)
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings | null>(null)
   const [notificationLoading, setNotificationLoading] = useState(false)
@@ -336,6 +363,10 @@ function App() {
   })
   const autoSaveTimers = useRef(new Map<string, number>())
   const buildEvents = useRef<EventSource | null>(null)
+  const buildAbortController = useRef<AbortController | null>(null)
+  const buildPrepareInFlight = useRef(false)
+  const buildCancelRequested = useRef(false)
+  const pendingBuildId = useRef<string | null>(null)
   const [buildHistory, setBuildHistory] = useState<Build[]>([])
   const [restoreProjectId] = useState(() => localStorage.getItem('android-web-ide.activeProjectId'))
   const cachedAccessMode = localStorage.getItem(accessModeKey)
@@ -635,6 +666,48 @@ function App() {
     setStorageOpen(true)
   }
 
+  async function loadArtifacts() {
+    if (!onlineAccess) {
+      setArtifactsError('daftar APK butuh koneksi ke server')
+      return
+    }
+    setArtifactsLoading(true)
+    setArtifactsError('')
+    try {
+      const response = await fetch('/api/artifacts')
+      const body = await response.text()
+      if (!response.ok) throw new Error(body || `gagal memuat daftar APK (${response.status})`)
+      setArtifacts(JSON.parse(body) as APKArtifact[])
+    } catch (error) {
+      setArtifactsError(error instanceof Error ? error.message : 'gagal memuat daftar APK')
+    } finally {
+      setArtifactsLoading(false)
+    }
+  }
+
+  function openArtifacts() {
+    setArtifactsOpen(true)
+    void loadArtifacts()
+  }
+
+  async function deleteArtifact(artifact: APKArtifact) {
+    const projectName = projects.find(project => project.id === artifact.projectId)?.name ?? artifact.projectId
+    if (!confirm(`hapus ${artifact.filename} dari project "${projectName}"? riwayat build tetap disimpan.`)) return
+    setArtifactDeletingId(artifact.buildId)
+    setArtifactsError('')
+    try {
+      const response = await fetch(`/api/artifacts/${encodeURIComponent(artifact.buildId)}`, { method: 'DELETE' })
+      const body = await response.text()
+      if (!response.ok) throw new Error(body || `gagal menghapus APK (${response.status})`)
+      setArtifacts(prev => prev.filter(item => item.buildId !== artifact.buildId))
+      setToast('APK dihapus; riwayat build tetap disimpan')
+    } catch (error) {
+      setArtifactsError(error instanceof Error ? error.message : 'gagal menghapus APK')
+    } finally {
+      setArtifactDeletingId(null)
+    }
+  }
+
   async function cleanStorage() {
     if (!onlineAccess) {
       setToast('Pembersihan storage build butuh koneksi ke server')
@@ -826,6 +899,7 @@ function App() {
     events.addEventListener('end', (event: MessageEvent<string>) => {
       const status = event.data as Build['status']
       setBuildStatus(status === 'success' || status === 'failed' || status === 'canceled' ? status : 'failed')
+      setBuildCanceling(false)
       events.close()
       if (buildEvents.current === events) buildEvents.current = null
       fetch(`/api/builds?projectId=${encodeURIComponent(build.projectId)}`)
@@ -841,6 +915,54 @@ function App() {
       setToast('log berhasil disalin')
     } catch (error) {
       setToast(error instanceof Error ? `gagal menyalin log: ${error.message}` : 'gagal menyalin log')
+    }
+  }
+
+  async function cancelActiveBuild() {
+    if (buildCanceling) return
+    const controller = buildAbortController.current
+    const currentBuildId = pendingBuildId.current ?? buildId
+    if (!currentBuildId) {
+      if (!controller) return
+      if (buildPrepareInFlight.current) {
+        buildCancelRequested.current = true
+        setBuildCanceling(true)
+        setLogs(prev => [...prev, 'Pembatalan menunggu reservasi build dari server...'])
+        return
+      }
+      setBuildCanceling(true)
+      controller.abort()
+      setBuildStatus('canceled')
+      setLogs(prev => [...prev, 'Build dibatalkan sebelum dikirim ke worker.'])
+      return
+    }
+    if (!onlineAccess) {
+      setToast('pembatalan build butuh koneksi ke server')
+      return
+    }
+    setBuildCanceling(true)
+    let waitForBuildEnd = false
+    try {
+      const response = await fetch(`/api/builds/${encodeURIComponent(currentBuildId)}`, { method: 'DELETE' })
+      if (!response.ok) {
+        const message = await response.text()
+        throw new Error(message || `gagal membatalkan build (${response.status})`)
+      }
+      if (controller) {
+        controller.abort()
+        setBuildStatus('canceled')
+        setLogs(prev => [...prev, 'Build dibatalkan.'])
+        setToast('build dibatalkan')
+      } else {
+        waitForBuildEnd = buildEvents.current !== null
+        if (!waitForBuildEnd) setBuildStatus('canceled')
+        setLogs(prev => [...prev, 'Permintaan pembatalan build dikirim, menunggu worker berhenti...'])
+        setToast('permintaan pembatalan build dikirim')
+      }
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'gagal membatalkan build')
+    } finally {
+      if (!waitForBuildEnd) setBuildCanceling(false)
     }
   }
 
@@ -864,17 +986,26 @@ function App() {
       return
     }
     setBuildOpen(true)
+    setBuildId(null)
+    setBuildCanceling(false)
+    buildPrepareInFlight.current = false
+    buildCancelRequested.current = false
+    pendingBuildId.current = null
     setBuildStatus('preparing')
     setLogs(['Menghitung SHA-256 dan menyiapkan manifest...'])
+    const controller = new AbortController()
+    buildAbortController.current = controller
     let reservation: Build | null = null
     let finalizeStarted = false
     try {
-      const manifestFiles = await createBuildManifest(buildFiles)
+      const manifestFiles = await createBuildManifest(buildFiles, controller.signal)
       const totalBytes = manifestFiles.reduce((sum, file) => sum + file.size, 0)
       if (totalBytes > 250 * 1024 * 1024) throw new Error('Ukuran project melebihi 250 MB')
+      buildPrepareInFlight.current = true
       const response = await fetch('/api/builds/prepare', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           projectId: activeProject.id,
           idempotencyKey: crypto.randomUUID(),
@@ -882,10 +1013,12 @@ function App() {
         }),
       })
       const body = await response.text()
+      buildPrepareInFlight.current = false
       let data: PrepareResponse
       try { data = JSON.parse(body) as PrepareResponse }
       catch { data = { error: body || `request gagal (${response.status})`, build: {} as Build, missingBlobs: [] } }
       if (response.status === 409 && data.build?.id) {
+        buildCancelRequested.current = false
         setToast('Project ini masih punya build aktif')
         followBuild(data.build)
         return
@@ -894,13 +1027,28 @@ function App() {
       if (!data.build?.id) throw new Error('server tidak mengembalikan reservasi build')
       const buildReservation = data.build
       reservation = buildReservation
+      pendingBuildId.current = buildReservation.id
       if (buildReservation.status !== 'preparing') {
+        buildCancelRequested.current = false
         setBuildHistory(prev => [buildReservation, ...prev.filter(item => item.id !== buildReservation.id)])
         followBuild(buildReservation)
         return
       }
       setBuildId(buildReservation.id)
       setBuildStatus('preparing')
+      if (buildCancelRequested.current) {
+        const cancelResponse = await fetch(`/api/builds/${encodeURIComponent(buildReservation.id)}`, { method: 'DELETE' })
+        if (!cancelResponse.ok) {
+          const message = await cancelResponse.text()
+          throw new Error(message || `gagal membatalkan build (${cancelResponse.status})`)
+        }
+        controller.abort()
+        buildCancelRequested.current = false
+        setBuildStatus('canceled')
+        setLogs(prev => [...prev, 'Build dibatalkan.'])
+        setToast('build dibatalkan')
+        return
+      }
       const binaryByPath = new Map(buildFiles.map(file => [file.path, file] as const))
       const binaryByHash = new Map(manifestFiles
         .filter(file => file.kind === 'binary')
@@ -915,6 +1063,7 @@ function App() {
         const uploadResponse = await fetch(`/api/builds/${buildReservation.id}/blobs/${hash}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/octet-stream' },
+          signal: controller.signal,
           body: binary,
         })
         if (!uploadResponse.ok) throw new Error(await uploadResponse.text() || `Upload binary gagal (${uploadResponse.status})`)
@@ -922,7 +1071,10 @@ function App() {
       setBuildStatus('assembling')
       setLogs(prev => [...prev, 'Binary lengkap, merakit workspace build...'])
       finalizeStarted = true
-      const finalizeResponse = await fetch(`/api/builds/${buildReservation.id}/finalize`, { method: 'POST' })
+      const finalizeResponse = await fetch(`/api/builds/${buildReservation.id}/finalize`, {
+        method: 'POST',
+        signal: controller.signal,
+      })
       const finalizeBody = await finalizeResponse.text()
       let build: Build
       try { build = JSON.parse(finalizeBody) as Build }
@@ -931,11 +1083,25 @@ function App() {
       setBuildHistory(prev => [build, ...prev.filter(item => item.id !== build.id)])
       followBuild(build)
     } catch (error) {
+      buildPrepareInFlight.current = false
       if (reservation && !finalizeStarted) {
         await fetch(`/api/builds/${reservation.id}`, { method: 'DELETE' }).catch(() => undefined)
       }
-      setBuildStatus('failed')
-      setLogs(prev => [...prev, error instanceof Error ? error.message : 'Gagal upload build'])
+      if (controller.signal.aborted || (buildCancelRequested.current && !reservation)) {
+        setBuildStatus('canceled')
+        setLogs(prev => prev.some(line => line.includes('Build dibatalkan'))
+          ? prev
+          : [...prev, 'Build dibatalkan.'])
+      } else {
+        setBuildStatus('failed')
+        setLogs(prev => [...prev, error instanceof Error ? error.message : 'Gagal upload build'])
+      }
+    } finally {
+      if (buildAbortController.current === controller) buildAbortController.current = null
+      buildPrepareInFlight.current = false
+      buildCancelRequested.current = false
+      pendingBuildId.current = null
+      setBuildCanceling(false)
     }
   }
 
@@ -1182,9 +1348,10 @@ function App() {
         {activeProject && <div className="project-title">{activeProject.name}</div>}
         {!onlineAccess && <div className="offline-indicator"><WifiOff size={14}/><span>offline · edit lokal</span></div>}
         {!isInstalled && <button className="install-btn" title="Install Android Web IDE" onClick={() => void installApp()}><Smartphone size={16}/><span>Install</span></button>}
-        <button className="build-btn" onClick={startBuild} disabled={!onlineAccess || !activeProject || buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building'} title={!onlineAccess ? 'Build APK butuh koneksi ke server' : undefined}>
+        <button className="build-btn" onClick={startBuild} disabled={!onlineAccess || !activeProject || buildCanceling || buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building'} title={!onlineAccess ? 'Build APK butuh koneksi ke server' : undefined}>
           <Play size={16} fill="currentColor"/><span>{!onlineAccess ? 'Offline' : buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building' ? 'Building...' : 'Build APK'}</span>
         </button>
+        <button className="icon-btn" title={onlineAccess ? 'APK tersimpan' : 'Perlu koneksi ke server'} onClick={openArtifacts} disabled={!onlineAccess}><Archive size={18}/></button>
         {authMode === 'private' && <button className="icon-btn" title={onlineAccess ? 'Notifikasi build' : 'Perlu koneksi ke server'} onClick={() => void openNotifications()} disabled={!onlineAccess}><Bell size={18}/></button>}
         <button className="icon-btn storage-btn" title={onlineAccess ? 'Kelola storage build' : 'Perlu koneksi ke server'} onClick={openStorage} disabled={!onlineAccess}><HardDrive size={18}/></button>
         {authMode === 'private' && <button className="icon-btn" title="Logout" onClick={logout}><LogOut size={18}/></button>}
@@ -1247,7 +1414,12 @@ function App() {
           </>
         ) : (
           <div className="home">
-            <div className="home-head"><div><small>ANDROID PROJECTS</small><h1>Workspace</h1></div><button className="primary-btn" onClick={() => setShowCreate(true)}><PackagePlus size={17}/>Project baru</button></div>
+            <div className="home-head"><div><small>ANDROID PROJECTS</small><h1>Workspace</h1></div>
+              <div className="home-actions">
+                <button className="tool-btn artifact-dashboard-btn" onClick={openArtifacts} disabled={!onlineAccess}><Archive size={16}/>APK tersimpan</button>
+                <button className="primary-btn" onClick={() => setShowCreate(true)}><PackagePlus size={17}/>Project baru</button>
+              </div>
+            </div>
             <div className="project-grid">
               {projects.map(project => (
                 <article className="project-card large" key={project.id}>
@@ -1270,6 +1442,11 @@ function App() {
           <div className="build-head">
             <div><small>BUILD STATUS</small><strong>{buildStatus === 'idle' ? 'Debug APK' : buildStatus}</strong></div>
             <div className="build-head-actions">
+              {(buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building') &&
+                <button className="icon-btn cancel-build-btn" title={buildCanceling ? 'Membatalkan build' : 'Batalkan build'}
+                  aria-label="Batalkan build" onClick={() => void cancelActiveBuild()} disabled={buildCanceling}>
+                  <Ban size={16}/>
+                </button>}
               <button className="icon-btn" title="Salin log" aria-label="Salin log" onClick={copyLogs} disabled={logs.length === 0}><Copy size={16}/></button>
               <button className="icon-btn" title="Tutup" aria-label="Tutup log" onClick={() => setBuildOpen(false)}><X size={18}/></button>
             </div>
@@ -1293,6 +1470,18 @@ function App() {
           onRefresh={() => void refreshStorageStats()}
           onCleanup={cleanStorage}
           onClose={() => setStorageOpen(false)}
+        />
+      )}
+      {artifactsOpen && (
+        <ArtifactDialog
+          artifacts={artifacts}
+          projects={projects}
+          loading={artifactsLoading}
+          deletingId={artifactDeletingId}
+          error={artifactsError}
+          onRefresh={() => void loadArtifacts()}
+          onDelete={artifact => void deleteArtifact(artifact)}
+          onClose={() => setArtifactsOpen(false)}
         />
       )}
       {notificationsOpen && (
@@ -1467,6 +1656,79 @@ function StorageDialog({ stats, loading, options, onOptionChange, onRefresh, onC
         <div className="storage-actions">
           <button className="tool-btn refresh-storage" onClick={onRefresh} disabled={loading}>{loading ? 'memuat…' : 'refresh ukuran'}</button>
           <button className="danger-btn" onClick={onCleanup} disabled={loading}>{loading ? 'membersihkan…' : 'bersihkan yang dipilih'}</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ArtifactDialog({ artifacts, projects, loading, deletingId, error, onRefresh, onDelete, onClose }: {
+  artifacts: APKArtifact[]
+  projects: Project[]
+  loading: boolean
+  deletingId: string | null
+  error: string
+  onRefresh: () => void
+  onDelete: (artifact: APKArtifact) => void
+  onClose: () => void
+}) {
+  const projectNames = new Map(projects.map(project => [project.id, project.name]))
+  const grouped = new Map<string, APKArtifact[]>()
+  for (const artifact of artifacts) {
+    const items = grouped.get(artifact.projectId) ?? []
+    items.push(artifact)
+    grouped.set(artifact.projectId, items)
+  }
+
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <div className="modal artifact-modal" onMouseDown={event => event.stopPropagation()}>
+        <div className="modal-head">
+          <div><small>BUILD ARTIFACTS</small><h2>APK tersimpan</h2></div>
+          <div className="artifact-head-actions">
+            <button className="icon-btn" title="Muat ulang" aria-label="Muat ulang" onClick={onRefresh} disabled={loading}>
+              <RefreshCw size={16}/>
+            </button>
+            <button className="icon-btn" title="Tutup" aria-label="Tutup" onClick={onClose}><X size={18}/></button>
+          </div>
+        </div>
+        <div className="artifact-summary">
+          {loading ? 'memuat daftar APK…' : `${artifacts.length} APK di ${grouped.size} project`}
+        </div>
+        {error && <div className="login-error">{error}</div>}
+        {!loading && artifacts.length === 0 && !error && (
+          <div className="artifact-empty">belum ada APK hasil build</div>
+        )}
+        <div className="artifact-groups">
+          {[...grouped.entries()].map(([projectId, items]) => (
+            <section className="artifact-group" key={projectId}>
+              <div className="artifact-project">
+                <strong>{projectNames.get(projectId) ?? projectId}</strong>
+                <span>{items.length} APK</span>
+              </div>
+              {items.map(artifact => (
+                <div className="artifact-row" key={artifact.buildId}>
+                  <div className="artifact-info">
+                    <strong>{artifact.filename}</strong>
+                    <span>{artifact.variant} · {new Date(artifact.createdAt).toLocaleString()} · {formatBytes(artifact.size)}</span>
+                    {!artifact.available && <small className="artifact-missing">file APK tidak tersedia di server</small>}
+                  </div>
+                  <div className="artifact-actions">
+                    {artifact.available
+                      ? <a className="icon-btn" title="Download APK" aria-label="Download APK"
+                          href={`/api/builds/${encodeURIComponent(artifact.buildId)}/artifact`} download>
+                          <Download size={16}/>
+                        </a>
+                      : <button className="icon-btn" title="APK tidak tersedia" aria-label="APK tidak tersedia" disabled><Download size={16}/></button>}
+                    <button className="icon-btn artifact-delete" title="Hapus APK" aria-label="Hapus APK"
+                      onClick={() => onDelete(artifact)} disabled={deletingId !== null}>
+                      <Trash2 size={16}/>
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </section>
+          ))}
         </div>
       </div>
     </div>
