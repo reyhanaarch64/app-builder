@@ -136,6 +136,7 @@ func (s *Server) enqueueBuildNotification(buildID, status string) {
 	if status != "success" && status != "failed" {
 		return
 	}
+	s.enqueueBuildPushNotifications(buildID, status)
 	settings, err := s.readNotificationSettings()
 	if err != nil {
 		log.Printf("failed to read build notification settings for %s: %v", buildID, err)

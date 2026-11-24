@@ -385,7 +385,8 @@ func TestLoadConfigCreatesPrivateDefaultFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.Mode != "public" || config.Port != 8866 || config.Build.Parallel != 1 {
+	if config.Mode != "public" || config.Port != 8866 || config.Build.Parallel != 1 ||
+		config.VAPIDSubject != vapidSubscriber {
 		t.Fatalf("unexpected default config: %+v", config)
 	}
 	info, err := os.Stat(path)
@@ -405,6 +406,22 @@ func TestLoadConfigRejectsPrivateModeWithoutPassword(t *testing.T) {
 	}
 	if _, err := loadConfig(path); err == nil || !strings.Contains(err.Error(), "password") {
 		t.Fatalf("expected private password validation error, got %v", err)
+	}
+}
+
+func TestLoadConfigRejectsInvalidVAPIDSubject(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "IDE.config")
+	config := defaultConfig()
+	config.VAPIDSubject = "javascript:alert(1)"
+	content, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path); err == nil || !strings.Contains(err.Error(), "vapidSubject") {
+		t.Fatalf("expected invalid VAPID subject error, got %v", err)
 	}
 }
 

@@ -78,6 +78,7 @@ Example:
   "port": 8866,
   "sessionTTLHours": 168,
   "secureCookie": true,
+  "vapidSubject": "mailto:admin@example.com",
   "build": {
     "maxUploadMB": 50,
     "timeoutMinutes": 30,
@@ -97,6 +98,8 @@ Email notification settings are global to this server and are available in priva
 For Gmail, enable 2-step verification, create an app password, and use it as the SMTP password (not the Google account password). Configure SMTP host `smtp.gmail.com`, port `587` (STARTTLS), sender username/email and the app password under the `smtp` section of `data/IDE.config`, then run `bash start.sh restart`. Port `465` with implicit TLS is also supported.
 
 The IDE sends a test email from the settings dialog. Build success/failure notifications are queued and retried after temporary SMTP errors or server restarts. Messages include build ID, project ID, variant, timestamps, duration, error and a short tail of build logs; the log excerpt can contain compiler context, but no APK is attached. Sent outbox entries are deleted after 30 days. Notification settings cannot be changed in public mode.
+
+Browser push notifications are also available in private mode. Open the notification settings on each browser and grant notification permission; the site must be served over HTTPS (localhost is allowed by browsers). Push subscriptions are scoped to the browser that owns the build, while the success/failure toggles apply to both email and browser push. VAPID keys are generated once and stored in the local database; set `vapidSubject` to a real `mailto:` address or HTTPS contact URL if desired. Push notifications use a durable retry queue and only include a short project/build summary.
 
 Check that the API is ready:
 

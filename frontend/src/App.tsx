@@ -3,7 +3,7 @@ import Editor from '@monaco-editor/react'
 import Dexie, { type Table } from 'dexie'
 import JSZip from 'jszip'
 import {
-  Box, ChevronRight, Copy, Download, FileCode2, FilePlus2, FolderPlus, HardDrive, Mail,
+  Bell, Box, ChevronRight, Copy, Download, FileCode2, FilePlus2, FolderPlus, HardDrive,
   LogOut, Menu, PackagePlus, Play, Search, Smartphone, Trash2, Upload, WifiOff,
   X,
 } from 'lucide-react'
@@ -68,6 +68,7 @@ type NotificationSettings = {
   notifyFailure: boolean
   smtpConfigured: boolean
 }
+type PushSubscriptionStatus = { subscribed: boolean }
 type InstallPromptEvent = Event & {
   prompt: () => Promise<void>
   userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>
@@ -227,6 +228,14 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(1)} ${units[unit]}`
 }
 
+function decodeVapidPublicKey(key: string): ArrayBuffer {
+  const base64 = key.replace(/-/g, '+').replace(/_/g, '/')
+  const raw = atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, '='))
+  const bytes = new Uint8Array(new ArrayBuffer(raw.length))
+  for (let index = 0; index < raw.length; index++) bytes[index] = raw.charCodeAt(index)
+  return bytes.buffer
+}
+
 async function createBuildManifest(files: ProjectFile[]): Promise<ManifestFile[]> {
   const encoder = new TextEncoder()
   const manifest: ManifestFile[] = []
@@ -310,6 +319,9 @@ function App() {
   const [notificationSaving, setNotificationSaving] = useState(false)
   const [notificationTesting, setNotificationTesting] = useState(false)
   const [notificationError, setNotificationError] = useState('')
+  const [pushSubscribed, setPushSubscribed] = useState(false)
+  const [pushPermission, setPushPermission] = useState<NotificationPermission>('default')
+  const [pushBusy, setPushBusy] = useState(false)
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null)
   const [loginPassword, setLoginPassword] = useState('')
   const [loginError, setLoginError] = useState('')
@@ -947,14 +959,121 @@ function App() {
     setNotificationLoading(true)
     setNotificationError('')
     try {
-      const response = await fetch('/api/notifications/settings')
-      const data = await response.json() as NotificationSettings & { error?: string }
-      if (!response.ok) throw new Error(data.error || 'gagal membaca pengaturan email')
-      setNotificationSettings(data)
+      const [settingsResponse, pushResponse] = await Promise.all([
+        fetch('/api/notifications/settings'),
+        fetch('/api/notifications/push/subscription'),
+      ])
+      const settings = await settingsResponse.json() as NotificationSettings & { error?: string }
+      if (!settingsResponse.ok) throw new Error(settings.error || 'gagal membaca pengaturan email')
+      const pushStatus = await pushResponse.json() as PushSubscriptionStatus & { error?: string }
+      if (!pushResponse.ok) throw new Error(pushStatus.error || 'gagal membaca status browser notification')
+      setNotificationSettings(settings)
+      const supported = 'Notification' in window && 'PushManager' in window && 'serviceWorker' in navigator
+      setPushPermission(supported ? Notification.permission : 'denied')
+      if (supported) {
+        const registration = await navigator.serviceWorker.ready
+        let subscription = await registration.pushManager.getSubscription()
+        if (subscription && !pushStatus.subscribed) {
+          const saveResponse = await fetch('/api/notifications/push/subscription', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(subscription.toJSON()),
+          })
+          if (!saveResponse.ok) throw new Error('gagal menyimpan browser notification')
+        } else if (!subscription && pushStatus.subscribed) {
+          await fetch('/api/notifications/push/subscription', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ endpoint: '' }),
+          })
+        }
+        setPushSubscribed(Boolean(subscription))
+      } else {
+        setPushSubscribed(false)
+      }
     } catch (error) {
-      setNotificationError(error instanceof Error ? error.message : 'gagal membaca pengaturan email')
+      setNotificationError(error instanceof Error ? error.message : 'gagal membaca pengaturan notifikasi')
     } finally {
       setNotificationLoading(false)
+    }
+  }
+
+  async function enablePushNotifications() {
+    if (!('Notification' in window) || !('PushManager' in window) || !('serviceWorker' in navigator)) {
+      setNotificationError('browser ini belum mendukung browser push notification')
+      return
+    }
+    setPushBusy(true)
+    setNotificationError('')
+    try {
+      const permission = Notification.permission === 'default'
+        ? await Notification.requestPermission()
+        : Notification.permission
+      setPushPermission(permission)
+      if (permission !== 'granted') throw new Error('izin notifikasi browser tidak diberikan')
+      const keyResponse = await fetch('/api/notifications/push/key')
+      const keyData = await keyResponse.json() as { publicKey?: string; error?: string }
+      if (!keyResponse.ok || !keyData.publicKey) throw new Error(keyData.error || 'gagal mengambil kunci browser notification')
+      const registration = await navigator.serviceWorker.ready
+      const subscription = await registration.pushManager.getSubscription() ??
+        await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: decodeVapidPublicKey(keyData.publicKey),
+        })
+      const response = await fetch('/api/notifications/push/subscription', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(subscription.toJSON()),
+      })
+      const data = await response.json() as { error?: string }
+      if (!response.ok) {
+        await subscription.unsubscribe()
+        throw new Error(data.error || 'gagal mengaktifkan browser notification')
+      }
+      setPushSubscribed(true)
+      setToast('browser notification aktif')
+    } catch (error) {
+      setNotificationError(error instanceof Error ? error.message : 'gagal mengaktifkan browser notification')
+    } finally {
+      setPushBusy(false)
+    }
+  }
+
+  async function disablePushNotifications() {
+    setPushBusy(true)
+    setNotificationError('')
+    try {
+      const registration = await navigator.serviceWorker.ready
+      const subscription = await registration.pushManager.getSubscription()
+      const response = await fetch('/api/notifications/push/subscription', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ endpoint: subscription?.endpoint ?? '' }),
+      })
+      const data = await response.json() as { error?: string }
+      if (!response.ok) throw new Error(data.error || 'gagal menonaktifkan browser notification')
+      if (subscription) await subscription.unsubscribe()
+      setPushSubscribed(false)
+      setToast('browser notification dinonaktifkan')
+    } catch (error) {
+      setNotificationError(error instanceof Error ? error.message : 'gagal menonaktifkan browser notification')
+    } finally {
+      setPushBusy(false)
+    }
+  }
+
+  async function sendTestPushNotification() {
+    setPushBusy(true)
+    setNotificationError('')
+    try {
+      const response = await fetch('/api/notifications/push/test', { method: 'POST' })
+      const data = await response.json() as { error?: string }
+      if (!response.ok) throw new Error(data.error || 'browser notification test gagal dikirim')
+      setToast('browser notification test dikirim')
+    } catch (error) {
+      setNotificationError(error instanceof Error ? error.message : 'browser notification test gagal dikirim')
+    } finally {
+      setPushBusy(false)
     }
   }
 
@@ -1066,7 +1185,7 @@ function App() {
         <button className="build-btn" onClick={startBuild} disabled={!onlineAccess || !activeProject || buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building'} title={!onlineAccess ? 'Build APK butuh koneksi ke server' : undefined}>
           <Play size={16} fill="currentColor"/><span>{!onlineAccess ? 'Offline' : buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building' ? 'Building...' : 'Build APK'}</span>
         </button>
-        {authMode === 'private' && <button className="icon-btn" title={onlineAccess ? 'Notifikasi email build' : 'Perlu koneksi ke server'} onClick={() => void openNotifications()} disabled={!onlineAccess}><Mail size={18}/></button>}
+        {authMode === 'private' && <button className="icon-btn" title={onlineAccess ? 'Notifikasi build' : 'Perlu koneksi ke server'} onClick={() => void openNotifications()} disabled={!onlineAccess}><Bell size={18}/></button>}
         <button className="icon-btn storage-btn" title={onlineAccess ? 'Kelola storage build' : 'Perlu koneksi ke server'} onClick={openStorage} disabled={!onlineAccess}><HardDrive size={18}/></button>
         {authMode === 'private' && <button className="icon-btn" title="Logout" onClick={logout}><LogOut size={18}/></button>}
       </header>
@@ -1182,10 +1301,16 @@ function App() {
           loading={notificationLoading}
           saving={notificationSaving}
           testing={notificationTesting}
+          pushBusy={pushBusy}
+          pushSupported={'Notification' in window && 'PushManager' in window && 'serviceWorker' in navigator}
+          pushSubscribed={pushSubscribed}
+          pushPermission={pushPermission}
           error={notificationError}
           onSettingsChange={setNotificationSettings}
           onSave={saveNotificationSettings}
           onTest={() => void sendTestNotification()}
+          onPushToggle={() => void (pushSubscribed ? disablePushNotifications() : enablePushNotifications())}
+          onPushTest={() => void sendTestPushNotification()}
           onClose={() => setNotificationsOpen(false)}
         />
       )}
@@ -1194,23 +1319,30 @@ function App() {
   )
 }
 
-function NotificationDialog({ settings, loading, saving, testing, error, onSettingsChange, onSave, onTest, onClose }: {
+function NotificationDialog({ settings, loading, saving, testing, pushBusy, pushSupported, pushSubscribed,
+  pushPermission, error, onSettingsChange, onSave, onTest, onPushToggle, onPushTest, onClose }: {
   settings: NotificationSettings | null
   loading: boolean
   saving: boolean
   testing: boolean
+  pushBusy: boolean
+  pushSupported: boolean
+  pushSubscribed: boolean
+  pushPermission: NotificationPermission
   error: string
   onSettingsChange: (settings: NotificationSettings | null) => void
   onSave: (event: FormEvent<HTMLFormElement>) => void
   onTest: () => void
+  onPushToggle: () => void
+  onPushTest: () => void
   onClose: () => void
 }) {
-  const busy = loading || saving || testing
+  const busy = loading || saving || testing || pushBusy
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <form className="modal notification-modal" onMouseDown={event => event.stopPropagation()} onSubmit={onSave}>
         <div className="modal-head">
-          <div><small>BUILD NOTIFICATIONS</small><h2>Email notifikasi</h2></div>
+          <div><small>BUILD NOTIFICATIONS</small><h2>Notifikasi build</h2></div>
           <button type="button" className="icon-btn" onClick={onClose}><X size={18}/></button>
         </div>
         {loading ? <p className="notification-info">memuat pengaturan…</p> : settings && (
@@ -1228,10 +1360,35 @@ function NotificationDialog({ settings, loading, saving, testing, error, onSetti
             <div className="notification-options">
               <label><input type="checkbox" checked={settings.notifySuccess}
                 onChange={event => onSettingsChange({ ...settings, notifySuccess: event.target.checked })}/>
-                <span><strong>Build berhasil</strong><small>kirim email saat APK selesai dibuat</small></span></label>
+                <span><strong>Build berhasil</strong><small>kirim notifikasi saat APK selesai dibuat</small></span></label>
               <label><input type="checkbox" checked={settings.notifyFailure}
                 onChange={event => onSettingsChange({ ...settings, notifyFailure: event.target.checked })}/>
-                <span><strong>Build gagal</strong><small>sertakan alasan dan cuplikan log terakhir</small></span></label>
+                <span><strong>Build gagal</strong><small>kirim notifikasi saat build gagal</small></span></label>
+            </div>
+            <section className="push-settings">
+              <div><strong>Browser push</strong>
+                <small>{!pushSupported
+                  ? 'browser ini belum mendukung push notification'
+                  : pushPermission === 'denied'
+                    ? 'izin notifikasi diblokir di pengaturan browser'
+                    : pushSubscribed ? 'browser ini siap menerima notifikasi build'
+                      : 'notifikasi bisa diterima saat IDE tidak sedang dibuka'}</small>
+              </div>
+              <div className="push-actions">
+                <button type="button" className="tool-btn refresh-storage" onClick={onPushToggle}
+                  disabled={busy || !pushSupported || pushPermission === 'denied'}>
+                  {pushBusy ? 'memproses…' : pushSubscribed ? 'nonaktifkan' : 'aktifkan'}
+                </button>
+                <button type="button" className="tool-btn refresh-storage" onClick={onPushTest}
+                  disabled={busy || !pushSubscribed}>
+                  kirim test
+                </button>
+              </div>
+            </section>
+            <div className="notification-info not-configured">
+              {settings.smtpConfigured
+                ? 'email juga aktif; kredensial pengirim disimpan di data/IDE.config.'
+                : 'email opsional: isi smtp di data/IDE.config untuk mengaktifkannya.'}
             </div>
           </>
         )}
