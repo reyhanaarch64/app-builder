@@ -28,6 +28,7 @@ type ProjectFile = {
   type: 'file' | 'directory'
   content?: string
   binary?: Blob
+  sha256?: string
   size: number
   createdAt: number
   updatedAt: number
@@ -36,7 +37,7 @@ type ProjectFile = {
 type Build = {
   id: string
   projectId: string
-  status: 'queued' | 'building' | 'success' | 'failed' | 'canceled'
+  status: 'preparing' | 'assembling' | 'queued' | 'building' | 'success' | 'failed' | 'canceled'
   variant: string
   createdAt: string
   error?: string
@@ -46,6 +47,7 @@ type Build = {
 type StorageStats = {
   workspaceBytes: number
   artifactBytes: number
+  blobBytes: number
   databaseBytes: number
   gradleCacheBytes: number
   buildHistory: number
@@ -60,6 +62,17 @@ type CleanupOptions = {
 }
 
 type AuthStatus = { mode: 'public' | 'private'; authenticated: boolean }
+
+type ManifestFile = {
+  path: string
+  kind: 'text' | 'binary'
+  size: number
+  mimeType: string
+  sha256: string
+  content?: string
+}
+
+type PrepareResponse = { build: Build; missingBlobs: string[]; error?: string }
 
 type ProjectEditorState = {
   openFileIds: string[]
@@ -202,6 +215,39 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(1)} ${units[unit]}`
 }
 
+async function createBuildManifest(files: ProjectFile[]): Promise<ManifestFile[]> {
+  const encoder = new TextEncoder()
+  const manifest: ManifestFile[] = []
+  for (const file of files) {
+    if (file.type !== 'file') continue
+    const kind = file.binary ? 'binary' : 'text'
+    const content = file.content ?? ''
+    const size = file.binary?.size ?? encoder.encode(content).byteLength
+    const cachedHash = file.sha256 === ''
+      ? undefined
+      : file.sha256 ?? (await db.files.get(file.id))?.sha256
+    let hash = cachedHash
+    if (!hash) {
+      const bytes = file.binary
+        ? new Uint8Array(await file.binary.arrayBuffer())
+        : encoder.encode(content)
+      hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)))
+        .map(value => value.toString(16).padStart(2, '0')).join('')
+    }
+    const updated = file.sha256 ? file : { ...file, sha256: hash }
+    if (!cachedHash) await db.files.put(updated)
+    manifest.push({
+      path: file.path,
+      kind,
+      size,
+      mimeType: kind === 'binary' ? file.binary?.type || 'application/octet-stream' : 'text/plain; charset=utf-8',
+      sha256: hash,
+      ...(kind === 'text' ? { content } : {}),
+    })
+  }
+  return manifest
+}
+
 async function ensureGeneratedJvmTargets(project: Project, files: ProjectFile[]): Promise<ProjectFile[]> {
   if (project.templateId !== 'empty-app') return files
   const moduleFile = files.find(file => /(^|\/)app\/build\.gradle\.kts$/.test(file.path))
@@ -219,6 +265,7 @@ async function ensureGeneratedJvmTargets(project: Project, files: ProjectFile[])
   const updated = {
     ...moduleFile,
     content: moduleFile.content.replace(compileSdk[0], `${compileSdk[0]}${compatibility}`),
+    sha256: '',
     updatedAt: Date.now(),
   }
   updated.size = new Blob([updated.content]).size
@@ -235,7 +282,7 @@ function App() {
   const [editorStateProjectId, setEditorStateProjectId] = useState<string | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [buildOpen, setBuildOpen] = useState(false)
-  const [buildStatus, setBuildStatus] = useState<'idle' | 'queued' | 'building' | 'success' | 'failed' | 'canceled'>('idle')
+  const [buildStatus, setBuildStatus] = useState<Build['status'] | 'idle'>('idle')
   const [logs, setLogs] = useState<string[]>([])
   const [buildId, setBuildId] = useState<string | null>(null)
   const [showCreate, setShowCreate] = useState(false)
@@ -461,7 +508,7 @@ function App() {
       return
     }
     const confirmed = confirm(
-      `Lanjut bersihkan storage?${cleanupOptions.history ? '\nRiwayat dan semua log build akan dihapus.' : ''}${cleanupOptions.artifacts || cleanupOptions.history ? '\nAPK hasil build yang dipilih akan dihapus.' : ''}${cleanupOptions.gradleCache ? '\nCache Gradle dihapus dan perlu diunduh ulang saat build berikutnya.' : ''}`,
+      `Lanjut bersihkan storage?${cleanupOptions.history ? '\nRiwayat, log, dan binary cache build akan dihapus.' : ''}${cleanupOptions.artifacts || cleanupOptions.history ? '\nAPK hasil build yang dipilih akan dihapus.' : ''}${cleanupOptions.gradleCache ? '\nCache Gradle dihapus dan perlu diunduh ulang saat build berikutnya.' : ''}`,
     )
     if (!confirmed) return
     setStorageLoading(true)
@@ -508,7 +555,7 @@ function App() {
   }
 
   async function saveFile(file: ProjectFile, content: string) {
-    const updated = { ...file, content, size: new Blob([content]).size, updatedAt: Date.now() }
+    const updated = { ...file, content, sha256: undefined, size: new Blob([content]).size, updatedAt: Date.now() }
     await db.files.put(updated)
     setFiles(prev => prev.map(f => f.id === file.id ? updated : f))
     setOpenTabs(prev => prev.map(f => f.id === file.id ? updated : f))
@@ -516,7 +563,10 @@ function App() {
 
   function editFile(content: string | undefined) {
     if (!activeFile || content === undefined) return
-    setFiles(prev => prev.map(f => f.id === activeFile.id ? { ...f, content } : f))
+    setFiles(prev => prev.map(f => f.id === activeFile.id ? { ...f, content, sha256: '' } : f))
+    void db.files.update(activeFile.id, { sha256: undefined }).catch(error => {
+      setToast(error instanceof Error ? error.message : 'gagal menginvalidasi hash file')
+    })
     const existingTimer = autoSaveTimers.current.get(activeFile.id)
     if (existingTimer) window.clearTimeout(existingTimer)
     const timer = window.setTimeout(() => saveFile(activeFile, content), 800)
@@ -659,7 +709,8 @@ function App() {
 
   async function startBuild() {
     if (!activeProject) return
-    if (buildStatus === 'queued' || buildStatus === 'building') {
+    if (buildStatus === 'preparing' || buildStatus === 'assembling' ||
+        buildStatus === 'queued' || buildStatus === 'building') {
       setBuildOpen(true)
       return
     }
@@ -671,37 +722,76 @@ function App() {
       return
     }
     setBuildOpen(true)
-    setBuildStatus('queued')
-    setLogs(['Memvalidasi dan mengemas project...'])
-    const zip = new JSZip()
-    for (const file of buildFiles) {
-      if (file.binary) zip.file(file.path, file.binary)
-      else zip.file(file.path, file.content ?? '')
-    }
-    const blob = await zip.generateAsync({ type: 'blob' })
-    if (blob.size > 1024 * 1024 * 1024) {
-      setBuildStatus('failed')
-      setLogs(prev => [...prev, 'ZIP project melebihi batas upload maksimum'])
-      return
-    }
-    const form = new FormData()
-    form.append('project', blob, `${activeProject.name}.zip`)
-    form.append('projectId', activeProject.id)
+    setBuildStatus('preparing')
+    setLogs(['Menghitung SHA-256 dan menyiapkan manifest...'])
+    let reservation: Build | null = null
+    let finalizeStarted = false
     try {
-      const response = await fetch('/api/builds', { method: 'POST', body: form })
+      const manifestFiles = await createBuildManifest(buildFiles)
+      const totalBytes = manifestFiles.reduce((sum, file) => sum + file.size, 0)
+      if (totalBytes > 250 * 1024 * 1024) throw new Error('Ukuran project melebihi 250 MB')
+      const response = await fetch('/api/builds/prepare', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          projectId: activeProject.id,
+          idempotencyKey: crypto.randomUUID(),
+          files: manifestFiles,
+        }),
+      })
       const body = await response.text()
-      let data: { error?: string; build?: Build } & Partial<Build>
-      try { data = JSON.parse(body) as typeof data }
-      catch { data = { error: body || `request gagal (${response.status})` } }
-      if (response.status === 409 && data.build) {
+      let data: PrepareResponse
+      try { data = JSON.parse(body) as PrepareResponse }
+      catch { data = { error: body || `request gagal (${response.status})`, build: {} as Build, missingBlobs: [] } }
+      if (response.status === 409 && data.build?.id) {
         setToast('Project ini masih punya build aktif')
-        followBuild(data.build as Build)
+        followBuild(data.build)
         return
       }
-      if (!response.ok) throw new Error(data.error || `Gagal mengirim build (${response.status})`)
-      setBuildHistory(prev => [data as Build, ...prev])
-      followBuild(data as Build)
+      if (!response.ok) throw new Error(data.error || body || `Gagal menyiapkan build (${response.status})`)
+      if (!data.build?.id) throw new Error('server tidak mengembalikan reservasi build')
+      const buildReservation = data.build
+      reservation = buildReservation
+      if (buildReservation.status !== 'preparing') {
+        setBuildHistory(prev => [buildReservation, ...prev.filter(item => item.id !== buildReservation.id)])
+        followBuild(buildReservation)
+        return
+      }
+      setBuildId(buildReservation.id)
+      setBuildStatus('preparing')
+      const binaryByPath = new Map(buildFiles.map(file => [file.path, file] as const))
+      const binaryByHash = new Map(manifestFiles
+        .filter(file => file.kind === 'binary')
+        .flatMap(file => {
+          const binary = binaryByPath.get(file.path)?.binary
+          return binary ? [[file.sha256, binary] as const] : []
+        }))
+      for (const [index, hash] of data.missingBlobs.entries()) {
+        const binary = binaryByHash.get(hash)
+        if (!binary) throw new Error(`binary ${hash} tidak ditemukan di IndexedDB`)
+        setLogs(prev => [...prev, `Mengupload binary ${index + 1}/${data.missingBlobs.length}...`])
+        const uploadResponse = await fetch(`/api/builds/${buildReservation.id}/blobs/${hash}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: binary,
+        })
+        if (!uploadResponse.ok) throw new Error(await uploadResponse.text() || `Upload binary gagal (${uploadResponse.status})`)
+      }
+      setBuildStatus('assembling')
+      setLogs(prev => [...prev, 'Binary lengkap, merakit workspace build...'])
+      finalizeStarted = true
+      const finalizeResponse = await fetch(`/api/builds/${buildReservation.id}/finalize`, { method: 'POST' })
+      const finalizeBody = await finalizeResponse.text()
+      let build: Build
+      try { build = JSON.parse(finalizeBody) as Build }
+      catch { throw new Error(finalizeBody || `Finalisasi build gagal (${finalizeResponse.status})`) }
+      if (!finalizeResponse.ok) throw new Error((build as Build & { error?: string }).error || `Finalisasi build gagal (${finalizeResponse.status})`)
+      setBuildHistory(prev => [build, ...prev.filter(item => item.id !== build.id)])
+      followBuild(build)
     } catch (error) {
+      if (reservation && !finalizeStarted) {
+        await fetch(`/api/builds/${reservation.id}`, { method: 'DELETE' }).catch(() => undefined)
+      }
       setBuildStatus('failed')
       setLogs(prev => [...prev, error instanceof Error ? error.message : 'Gagal upload build'])
     }
@@ -756,8 +846,8 @@ function App() {
         <button className="icon-btn" onClick={() => setDrawerOpen(v => !v)}><Menu size={20}/></button>
         <div className="brand"><div className="brand-mark"><Box size={18}/></div><span>Droid Studio</span></div>
         {activeProject && <div className="project-title">{activeProject.name}</div>}
-        <button className="build-btn" onClick={startBuild} disabled={!activeProject || buildStatus === 'queued' || buildStatus === 'building'}>
-          <Play size={16} fill="currentColor"/><span>{buildStatus === 'queued' || buildStatus === 'building' ? 'Building...' : 'Build APK'}</span>
+        <button className="build-btn" onClick={startBuild} disabled={!activeProject || buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building'}>
+          <Play size={16} fill="currentColor"/><span>{buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building' ? 'Building...' : 'Build APK'}</span>
         </button>
         <button className="icon-btn storage-btn" title="Kelola storage build" onClick={openStorage}><HardDrive size={18}/></button>
         {authStatus.mode === 'private' && <button className="icon-btn" title="Logout" onClick={logout}><LogOut size={18}/></button>}
@@ -851,7 +941,7 @@ function App() {
             const build = buildHistory.find(item => item.id === event.target.value)
             if (build) followBuild(build)
           }}>{buildHistory.map(build => <option key={build.id} value={build.id}>{build.status} · {new Date(build.createdAt).toLocaleString()}</option>)}</select></label></div>}
-          <div className={`status-line ${buildStatus}`}><span></span>{buildStatus === 'building' ? 'Building...' : buildStatus === 'success' ? 'Build berhasil' : buildStatus === 'failed' ? 'Build gagal' : buildStatus === 'canceled' ? 'Build dibatalkan' : 'Menunggu worker'}</div>
+          <div className={`status-line ${buildStatus}`}><span></span>{buildStatus === 'preparing' ? 'Menyiapkan manifest dan binary...' : buildStatus === 'assembling' ? 'Merakit workspace...' : buildStatus === 'building' ? 'Building...' : buildStatus === 'success' ? 'Build berhasil' : buildStatus === 'failed' ? 'Build gagal' : buildStatus === 'canceled' ? 'Build dibatalkan' : 'Menunggu worker'}</div>
           <div className="log-view">{logs.map((line, i) => <div key={i}><span>{String(i + 1).padStart(3, '0')}</span>{line}</div>)}</div>
           {buildStatus === 'success' && buildId && buildHistory.find(build => build.id === buildId)?.artifact &&
             <a className="download-btn" href={`/api/builds/${buildId}/artifact`} download><Download size={17}/>Download APK</a>}
@@ -918,6 +1008,7 @@ function StorageDialog({ stats, loading, options, onOptionChange, onRefresh, onC
         <div className="storage-stats">
           <div><span>Build workspaces</span><strong>{stats ? formatBytes(stats.workspaceBytes) : '—'}</strong></div>
           <div><span>APK artifacts</span><strong>{stats ? formatBytes(stats.artifactBytes) : '—'}</strong></div>
+          <div><span>Binary asset cache</span><strong>{stats ? formatBytes(stats.blobBytes) : '—'}</strong></div>
           <div><span>Gradle cache · Docker volume</span><strong>{stats ? formatBytes(stats.gradleCacheBytes) : '—'}</strong></div>
           <div><span>Database · {stats?.buildHistory ?? 0} build records</span><strong>{stats ? formatBytes(stats.databaseBytes) : '—'}</strong></div>
         </div>
@@ -925,7 +1016,7 @@ function StorageDialog({ stats, loading, options, onOptionChange, onRefresh, onC
         <div className="cleanup-options">
           <label><input type="checkbox" checked={options.workspaces} onChange={event => onOptionChange('workspaces', event.target.checked)}/><span><strong>workspace lama</strong><small>hapus source ZIP dan output build yang tertinggal</small></span></label>
           <label><input type="checkbox" checked={options.artifacts} onChange={event => onOptionChange('artifacts', event.target.checked)}/><span><strong>APK artifacts</strong><small>APK terhapus dan tidak bisa didownload lagi</small></span></label>
-          <label><input type="checkbox" checked={options.history} onChange={event => onOptionChange('history', event.target.checked)}/><span><strong>riwayat dan log build</strong><small>juga menghapus workspace serta APK terkait</small></span></label>
+          <label><input type="checkbox" checked={options.history} onChange={event => onOptionChange('history', event.target.checked)}/><span><strong>riwayat dan log build</strong><small>melepas binary cache terkait lalu menjalankan garbage collection</small></span></label>
           <label><input type="checkbox" checked={options.gradleCache} onChange={event => onOptionChange('gradleCache', event.target.checked)}/><span><strong>Gradle dependency cache</strong><small>build berikutnya perlu download dependency lagi</small></span></label>
         </div>
         <div className="storage-actions">

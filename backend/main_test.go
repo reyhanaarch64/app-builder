@@ -60,20 +60,189 @@ func TestExtractZipRejectsTraversal(t *testing.T) {
 	}
 }
 
+func TestNormalizeManifestRejectsUnsafePathAndBadTextHash(t *testing.T) {
+	content := []byte("settings")
+	base := BuildManifest{
+		ProjectID: "project-1", IdempotencyKey: "request",
+		Files: []ManifestFile{{
+			Path: "settings.gradle.kts", Kind: "text", Size: int64(len(content)),
+			MIMEType: "text/plain", SHA256: hashBytes(content), Content: string(content),
+		}},
+	}
+	unsafe := base
+	unsafe.Files = append([]ManifestFile(nil), base.Files...)
+	unsafe.Files[0].Path = "../settings.gradle.kts"
+	if _, _, err := normalizeManifest(unsafe); err == nil {
+		t.Fatal("expected traversal path to be rejected")
+	}
+	mismatched := base
+	mismatched.Files = append([]ManifestFile(nil), base.Files...)
+	mismatched.Files[0].Content = "changed"
+	if _, _, err := normalizeManifest(mismatched); err == nil {
+		t.Fatal("expected text content with a mismatched hash to be rejected")
+	}
+}
+
 func TestBuildListReturnsPersistedBuilds(t *testing.T) {
 	db := testDB(t)
-	_, err := db.Exec(`INSERT INTO builds (id,project_id,status,variant,created_at)
-		VALUES ('build-1','project-1','building','debug','2026-01-01T00:00:00Z')`)
+	ownerID := strings.Repeat("a", 64)
+	_, err := db.Exec(`INSERT INTO owners(id,created_at,last_seen_at) VALUES(?,?,?)`,
+		ownerID, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO builds (id,project_id,owner_id,status,variant,created_at)
+		VALUES ('build-1','project-1',?,'building','debug','2026-01-01T00:00:00Z')`, ownerID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	server := &Server{db: db}
 	request := httptest.NewRequest(http.MethodGet, "/api/builds?projectId=project-1", nil)
+	request.AddCookie(&http.Cookie{Name: "ide_owner", Value: ownerID})
 	response := httptest.NewRecorder()
 	server.handleBuildList(response, request)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"id":"build-1"`) ||
 		!strings.Contains(response.Body.String(), `"status":"building"`) {
 		t.Fatalf("unexpected build list response: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestBlobBuildPipelineIsOwnerScopedAndVerifiesContent(t *testing.T) {
+	db := testDB(t)
+	dataDir := t.TempDir()
+	for _, directory := range []string{"workspaces", "blobs/sha256"} {
+		if err := os.MkdirAll(filepath.Join(dataDir, directory), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ownerA, ownerB := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	for _, owner := range []string{ownerA, ownerB} {
+		if _, err := db.Exec(`INSERT INTO owners(id,created_at,last_seen_at) VALUES(?,?,?)`, owner, "now", "now"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := &Server{db: db, dataDir: dataDir, config: AppConfig{SecureCookie: false}, building: map[string]bool{}}
+	binary := []byte{0, 1, 2, 255, 17}
+	textFiles := []struct{ path, content string }{
+		{"settings.gradle.kts", `rootProject.name = "test"` + "\ninclude(\":app\")\n"},
+		{"app/build.gradle.kts", "plugins { id(\"com.android.application\") }\n"},
+		{"app/src/main/AndroidManifest.xml", `<manifest xmlns:android="http://schemas.android.com/apk/res/android"><application/></manifest>`},
+	}
+	manifest := BuildManifest{
+		ProjectID: "project-1", IdempotencyKey: "request-a",
+	}
+	for _, file := range textFiles {
+		content := []byte(file.content)
+		manifest.Files = append(manifest.Files, ManifestFile{
+			Path: file.path, Kind: "text", Size: int64(len(content)), MIMEType: "text/plain", SHA256: hashBytes(content), Content: file.content,
+		})
+	}
+	blobHash := hashBytes(binary)
+	manifest.Files = append(manifest.Files, ManifestFile{
+		Path: "app/src/main/res/drawable/icon.png", Kind: "binary", Size: int64(len(binary)),
+		MIMEType: "image/png", SHA256: blobHash,
+	})
+	prepare := func(owner, idempotencyKey string) (PrepareResponse, int) {
+		t.Helper()
+		copyManifest := manifest
+		copyManifest.IdempotencyKey = idempotencyKey
+		body, err := json.Marshal(copyManifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodPost, "/api/builds/prepare", strings.NewReader(string(body)))
+		request.AddCookie(&http.Cookie{Name: "ide_owner", Value: owner})
+		response := httptest.NewRecorder()
+		server.handleBuildPrepare(response, request)
+		var result PrepareResponse
+		if response.Code == http.StatusCreated || response.Code == http.StatusOK {
+			if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return result, response.Code
+	}
+	first, status := prepare(ownerA, "request-a")
+	if status != http.StatusCreated || len(first.MissingBlobs) != 1 || first.MissingBlobs[0] != blobHash {
+		t.Fatalf("unexpected first prepare: status=%d response=%+v", status, first)
+	}
+	second, status := prepare(ownerB, "request-b")
+	if status != http.StatusCreated || len(second.MissingBlobs) != 1 {
+		t.Fatalf("expected owner B to miss owner A's cached blob: status=%d response=%+v", status, second)
+	}
+	if _, err := db.Exec(`UPDATE build_manifests SET expires_at='2000-01-01T00:00:00Z' WHERE build_id=?`, second.Build.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	uploadURL := "/api/builds/" + first.Build.ID + "/blobs/" + blobHash
+	foreignUpload := httptest.NewRequest(http.MethodPut, uploadURL, strings.NewReader(string(binary)))
+	foreignUpload.AddCookie(&http.Cookie{Name: "ide_owner", Value: ownerB})
+	foreignResponse := httptest.NewRecorder()
+	server.handleBuildRoutes(foreignResponse, foreignUpload)
+	if foreignResponse.Code != http.StatusNotFound {
+		t.Fatalf("expected foreign owner upload to be hidden, got %d", foreignResponse.Code)
+	}
+
+	badUpload := httptest.NewRequest(http.MethodPut, uploadURL, strings.NewReader("wrong"))
+	badUpload.AddCookie(&http.Cookie{Name: "ide_owner", Value: ownerA})
+	badResponse := httptest.NewRecorder()
+	server.handleBuildRoutes(badResponse, badUpload)
+	if badResponse.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected mismatched hash to be rejected, got %d: %s", badResponse.Code, badResponse.Body.String())
+	}
+	goodUpload := httptest.NewRequest(http.MethodPut, uploadURL, strings.NewReader(string(binary)))
+	goodUpload.AddCookie(&http.Cookie{Name: "ide_owner", Value: ownerA})
+	goodResponse := httptest.NewRecorder()
+	server.handleBuildRoutes(goodResponse, goodUpload)
+	if goodResponse.Code != http.StatusNoContent {
+		t.Fatalf("expected verified upload, got %d: %s", goodResponse.Code, goodResponse.Body.String())
+	}
+
+	server.startBuildFn = func(_, _ string) {}
+	finalize := httptest.NewRequest(http.MethodPost, "/api/builds/"+first.Build.ID+"/finalize", nil)
+	finalize.AddCookie(&http.Cookie{Name: "ide_owner", Value: ownerA})
+	finalized := httptest.NewRecorder()
+	server.handleBuildRoutes(finalized, finalize)
+	if finalized.Code != http.StatusCreated {
+		t.Fatalf("expected successful finalize, got %d: %s", finalized.Code, finalized.Body.String())
+	}
+	workspaceFile := filepath.Join(dataDir, "workspaces", first.Build.ID, "app/src/main/res/drawable/icon.png")
+	if content, err := os.ReadFile(workspaceFile); err != nil || string(content) != string(binary) {
+		t.Fatalf("assembled binary mismatch: content=%v err=%v", content, err)
+	}
+	var refCount int
+	if err := db.QueryRow(`SELECT ref_count FROM blobs WHERE owner_id=? AND sha256=?`, ownerA, blobHash).Scan(&refCount); err != nil || refCount != 1 {
+		t.Fatalf("expected one build ref, got refcount=%d err=%v", refCount, err)
+	}
+	if _, err := db.Exec(`UPDATE builds SET status='failed' WHERE id=?`, first.Build.ID); err != nil {
+		t.Fatal(err)
+	}
+	reused, status := prepare(ownerA, "request-a-retry")
+	if status != http.StatusCreated || len(reused.MissingBlobs) != 0 {
+		t.Fatalf("expected same owner to reuse cached blob: status=%d response=%+v", status, reused)
+	}
+	finalizeReuse := httptest.NewRequest(http.MethodPost, "/api/builds/"+reused.Build.ID+"/finalize", nil)
+	finalizeReuse.AddCookie(&http.Cookie{Name: "ide_owner", Value: ownerA})
+	reusedResponse := httptest.NewRecorder()
+	server.handleBuildRoutes(reusedResponse, finalizeReuse)
+	if reusedResponse.Code != http.StatusCreated {
+		t.Fatalf("expected cache-reusing build to finalize, got %d: %s", reusedResponse.Code, reusedResponse.Body.String())
+	}
+	if err := db.QueryRow(`SELECT ref_count FROM blobs WHERE owner_id=? AND sha256=?`, ownerA, blobHash).Scan(&refCount); err != nil || refCount != 2 {
+		t.Fatalf("expected two build refs to retain the blob, got refcount=%d err=%v", refCount, err)
+	}
+	if err := server.releaseAllBuildBlobRefs(); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.collectExpiredBlobReservations(); err != nil {
+		t.Fatal(err)
+	}
+	var expiredStatus string
+	if err := db.QueryRow(`SELECT status FROM builds WHERE id=?`, second.Build.ID).Scan(&expiredStatus); err != nil || expiredStatus != "failed" {
+		t.Fatalf("expected abandoned reservation to expire, got status=%q err=%v", expiredStatus, err)
+	}
+	if _, err := os.Stat(server.blobPath(ownerA, blobHash)); !os.IsNotExist(err) {
+		t.Fatalf("expected unreferenced blob to be garbage collected, got %v", err)
 	}
 }
 

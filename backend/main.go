@@ -72,6 +72,8 @@ type Server struct {
 	buildMu       sync.Mutex
 	maintenanceMu sync.Mutex
 	building      map[string]bool
+	startBuildFn  func(string, string)
+	ownerMu       sync.Mutex
 	sessionMu     sync.Mutex
 	sessions      map[string]session
 	loginMu       sync.Mutex
@@ -87,6 +89,9 @@ func main() {
 		log.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(dataDir, "artifacts"), 0750); err != nil {
+		log.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dataDir, "blobs"), 0700); err != nil {
 		log.Fatal(err)
 	}
 	config, err := loadConfig(configPath)
@@ -106,12 +111,14 @@ func main() {
 		buildSlots: make(chan struct{}, config.Build.Parallel), building: map[string]bool{},
 		sessions: make(map[string]session), loginFailures: make(map[string]loginAttempts),
 	}
+	go s.runBlobGC()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/auth/status", s.handleAuthStatus)
 	mux.HandleFunc("/api/auth/login", s.handleLogin)
 	mux.HandleFunc("/api/auth/logout", s.handleLogout)
 	mux.HandleFunc("/api/builds", s.handleBuildCollection)
+	mux.HandleFunc("/api/builds/prepare", s.handleBuildPrepare)
 	mux.HandleFunc("/api/builds/", s.handleBuildRoutes)
 	mux.HandleFunc("/api/maintenance/storage", s.handleStorage)
 	mux.HandleFunc("/api/maintenance/cleanup", s.handleCleanup)
@@ -125,6 +132,10 @@ func schema(db *sql.DB) {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS builds (
 		id TEXT PRIMARY KEY,
 		project_id TEXT NOT NULL DEFAULT '',
+		owner_id TEXT NOT NULL DEFAULT '',
+		idempotency_key TEXT NOT NULL DEFAULT '',
+		manifest_hash TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL DEFAULT '',
 		status TEXT NOT NULL,
 		variant TEXT NOT NULL,
 		created_at TEXT NOT NULL,
@@ -152,8 +163,61 @@ func schema(db *sql.DB) {
 			log.Fatal(err)
 		}
 	}
-	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS builds_one_active_per_project
-		ON builds(project_id) WHERE project_id != '' AND status IN ('queued','building')`); err != nil {
+	for column, definition := range map[string]string{
+		"owner_id":        "TEXT NOT NULL DEFAULT ''",
+		"idempotency_key": "TEXT NOT NULL DEFAULT ''",
+		"manifest_hash":   "TEXT NOT NULL DEFAULT ''",
+		"updated_at":      "TEXT NOT NULL DEFAULT ''",
+	} {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('builds') WHERE name=?`, column).Scan(&count); err != nil {
+			log.Fatal(err)
+		}
+		if count == 0 {
+			if _, err := db.Exec(`ALTER TABLE builds ADD COLUMN ` + column + ` ` + definition); err != nil {
+				log.Fatal(err)
+			}
+		}
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS owners (
+		id TEXT PRIMARY KEY,
+		created_at TEXT NOT NULL,
+		last_seen_at TEXT NOT NULL
+	); CREATE TABLE IF NOT EXISTS blobs (
+		owner_id TEXT NOT NULL,
+		sha256 TEXT NOT NULL,
+		size INTEGER NOT NULL,
+		ref_count INTEGER NOT NULL DEFAULT 0,
+		created_at TEXT NOT NULL,
+		PRIMARY KEY(owner_id,sha256)
+	); CREATE TABLE IF NOT EXISTS build_manifests (
+		build_id TEXT PRIMARY KEY,
+		manifest TEXT NOT NULL,
+		expires_at TEXT NOT NULL
+	); CREATE TABLE IF NOT EXISTS blob_reservations (
+		build_id TEXT NOT NULL,
+		owner_id TEXT NOT NULL,
+		sha256 TEXT NOT NULL,
+		expires_at TEXT NOT NULL,
+		PRIMARY KEY(build_id,sha256)
+	); CREATE TABLE IF NOT EXISTS build_blob_refs (
+		build_id TEXT NOT NULL,
+		owner_id TEXT NOT NULL,
+		sha256 TEXT NOT NULL,
+		counted INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY(build_id,sha256)
+	);`); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP INDEX IF EXISTS builds_one_active_per_project`); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS builds_one_active_per_owner_project
+		ON builds(owner_id,project_id) WHERE project_id != '' AND status IN ('preparing','assembling','queued','building')`); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS builds_one_request_per_owner
+		ON builds(owner_id,idempotency_key) WHERE idempotency_key != ''`); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -244,6 +308,10 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, err := s.ensureOwner(w, r); err != nil {
+		http.Error(w, "gagal membuat identitas browser", http.StatusInternalServerError)
 		return
 	}
 	authenticated := s.config.Mode == "public" || s.hasValidSession(r)
@@ -378,6 +446,7 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 type StorageStats struct {
 	WorkspaceBytes   int64 `json:"workspaceBytes"`
 	ArtifactBytes    int64 `json:"artifactBytes"`
+	BlobBytes        int64 `json:"blobBytes"`
 	DatabaseBytes    int64 `json:"databaseBytes"`
 	GradleCacheBytes int64 `json:"gradleCacheBytes"`
 	BuildHistory     int64 `json:"buildHistory"`
@@ -423,7 +492,7 @@ func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
 	var active int64
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM builds WHERE status IN ('queued','building')`).Scan(&active); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM builds WHERE status IN ('preparing','assembling','queued','building')`).Scan(&active); err != nil {
 		http.Error(w, "gagal memeriksa build aktif", http.StatusInternalServerError)
 		return
 	}
@@ -456,6 +525,26 @@ func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if request.History {
+		if err := s.releaseAllBuildBlobRefs(); err != nil {
+			http.Error(w, "gagal melepas referensi binary cache: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := s.collectExpiredBlobReservations(); err != nil {
+			http.Error(w, "gagal membersihkan binary cache: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if _, err := s.db.Exec(`DELETE FROM build_manifests`); err != nil {
+			http.Error(w, "gagal menghapus manifest build", http.StatusInternalServerError)
+			return
+		}
+		if _, err := s.db.Exec(`DELETE FROM blob_reservations`); err != nil {
+			http.Error(w, "gagal menghapus reservation binary", http.StatusInternalServerError)
+			return
+		}
+		if err := removeDirectoryContents(filepath.Join(s.dataDir, "blobs", "sha256")); err != nil {
+			http.Error(w, "gagal menghapus blob cache: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 		if _, err := s.db.Exec(`DELETE FROM build_logs`); err != nil {
 			http.Error(w, "gagal menghapus log build", http.StatusInternalServerError)
 			return
@@ -485,6 +574,7 @@ func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
 		"removed": map[string]int64{
 			"workspaceBytes":   before.WorkspaceBytes - after.WorkspaceBytes,
 			"artifactBytes":    before.ArtifactBytes - after.ArtifactBytes,
+			"blobBytes":        before.BlobBytes - after.BlobBytes,
 			"databaseBytes":    before.DatabaseBytes - after.DatabaseBytes,
 			"gradleCacheBytes": before.GradleCacheBytes - after.GradleCacheBytes,
 		},
@@ -503,6 +593,10 @@ func (s *Server) storageStats() (StorageStats, error) {
 	if err != nil {
 		return stats, err
 	}
+	stats.BlobBytes, err = directorySize(filepath.Join(s.dataDir, "blobs", "sha256"))
+	if err != nil {
+		return stats, err
+	}
 	for _, path := range []string{
 		filepath.Join(s.dataDir, "ide.db"),
 		filepath.Join(s.dataDir, "ide.db-wal"),
@@ -517,7 +611,7 @@ func (s *Server) storageStats() (StorageStats, error) {
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM builds`).Scan(&stats.BuildHistory); err != nil {
 		return stats, err
 	}
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM builds WHERE status IN ('queued','building')`).Scan(&stats.ActiveBuilds); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM builds WHERE status IN ('preparing','assembling','queued','building')`).Scan(&stats.ActiveBuilds); err != nil {
 		return stats, err
 	}
 	cacheSizeFn := s.cacheSizeFn
@@ -665,8 +759,13 @@ func (s *Server) handleBuildList(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "projectId tidak valid", http.StatusBadRequest)
 		return
 	}
+	ownerID, err := s.ensureOwner(w, r)
+	if err != nil {
+		http.Error(w, "gagal membuat identitas browser", http.StatusInternalServerError)
+		return
+	}
 	rows, err := s.db.Query(`SELECT id,project_id,status,variant,created_at,started_at,finished_at,error,artifact
-		FROM builds WHERE project_id=? ORDER BY created_at DESC,id DESC LIMIT 20`, projectID)
+		FROM builds WHERE owner_id=? AND project_id=? ORDER BY created_at DESC,id DESC LIMIT 20`, ownerID, projectID)
 	if err != nil {
 		http.Error(w, "gagal membaca riwayat build", http.StatusInternalServerError)
 		return
@@ -713,7 +812,12 @@ func (s *Server) handleBuildCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
-	if b, err := s.getActiveBuild(projectID); err == nil {
+	ownerID, err := s.ensureOwner(w, r)
+	if err != nil {
+		http.Error(w, "gagal membuat identitas browser", 500)
+		return
+	}
+	if b, err := s.getActiveBuild(ownerID, projectID); err == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		json.NewEncoder(w).Encode(map[string]any{"error": "project ini masih punya build aktif", "build": b})
@@ -769,10 +873,10 @@ func (s *Server) handleBuildCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
-	if _, err := s.db.Exec(`INSERT INTO builds (id,project_id,status,variant,created_at) VALUES (?,?,?,?,?)`,
-		id, projectID, "queued", "debug", now); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO builds (id,project_id,owner_id,status,variant,created_at,updated_at) VALUES (?,?,?,?,?,?,?)`,
+		id, projectID, ownerID, "queued", "debug", now, now); err != nil {
 		os.RemoveAll(workspace)
-		if b, activeErr := s.getActiveBuild(projectID); activeErr == nil {
+		if b, activeErr := s.getActiveBuild(ownerID, projectID); activeErr == nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			json.NewEncoder(w).Encode(map[string]any{"error": "project ini masih punya build aktif", "build": b})
@@ -782,22 +886,30 @@ func (s *Server) handleBuildCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.addLog(id, "system", "Build job dibuat")
-	go s.runBuild(id, workspace)
+	s.startBuild(id, workspace)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(Build{ID: id, ProjectID: projectID, Status: "queued", Variant: "debug", CreatedAt: now})
 }
 
+func (s *Server) startBuild(id, workspace string) {
+	if s.startBuildFn != nil {
+		s.startBuildFn(id, workspace)
+		return
+	}
+	go s.runBuild(id, workspace)
+}
+
 var projectIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 func validProjectID(id string) bool { return projectIDPattern.MatchString(id) }
 
-func (s *Server) getActiveBuild(projectID string) (Build, error) {
+func (s *Server) getActiveBuild(ownerID, projectID string) (Build, error) {
 	var b Build
 	var started, finished, errMsg, artifact sql.NullString
 	err := s.db.QueryRow(`SELECT id,project_id,status,variant,created_at,started_at,finished_at,error,artifact
-		FROM builds WHERE project_id=? AND status IN ('queued','building') ORDER BY created_at DESC,id DESC LIMIT 1`, projectID).
+		FROM builds WHERE owner_id=? AND project_id=? AND status IN ('preparing','assembling','queued','building') ORDER BY created_at DESC,id DESC LIMIT 1`, ownerID, projectID).
 		Scan(&b.ID, &b.ProjectID, &b.Status, &b.Variant, &b.CreatedAt, &started, &finished, &errMsg, &artifact)
 	if err != nil {
 		return b, err
@@ -814,19 +926,63 @@ func (s *Server) handleBuildRoutes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := parts[0]
+	ownerID, err := s.ensureOwner(w, r)
+	if err != nil {
+		http.Error(w, "gagal membuat identitas browser", http.StatusInternalServerError)
+		return
+	}
 	action := ""
 	if len(parts) > 1 {
 		action = parts[1]
 	}
 
 	switch action {
+	case "blobs":
+		if len(parts) != 3 {
+			http.Error(w, "hash binary wajib diisi", http.StatusBadRequest)
+			return
+		}
+		s.handleBuildBlobUpload(w, r, ownerID, id, parts[2])
+	case "finalize":
+		s.handleBuildFinalize(w, r, ownerID, id)
 	case "":
 		if r.Method == http.MethodDelete {
-			s.db.Exec(`UPDATE builds SET status='canceled',finished_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339), id)
+			s.maintenanceMu.Lock()
+			defer s.maintenanceMu.Unlock()
+			if _, err := s.getBuildForOwner(ownerID, id); err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			now := time.Now().UTC().Format(time.RFC3339)
+			tx, err := s.db.Begin()
+			if err != nil {
+				http.Error(w, "gagal membatalkan build", http.StatusInternalServerError)
+				return
+			}
+			if _, err := tx.Exec(`UPDATE builds SET status='canceled',finished_at=?,updated_at=? WHERE id=? AND owner_id=?`,
+				now, now, id, ownerID); err != nil {
+				tx.Rollback()
+				http.Error(w, "gagal membatalkan build", http.StatusInternalServerError)
+				return
+			}
+			if _, err := tx.Exec(`DELETE FROM build_manifests WHERE build_id=?`, id); err != nil {
+				tx.Rollback()
+				http.Error(w, "build dibatalkan, tetapi manifest gagal dihapus", http.StatusInternalServerError)
+				return
+			}
+			if _, err := tx.Exec(`DELETE FROM blob_reservations WHERE build_id=?`, id); err != nil {
+				tx.Rollback()
+				http.Error(w, "build dibatalkan, tetapi reservasi binary gagal dihapus", http.StatusInternalServerError)
+				return
+			}
+			if err := tx.Commit(); err != nil {
+				http.Error(w, "gagal menyelesaikan pembatalan build", http.StatusInternalServerError)
+				return
+			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		build, err := s.getBuild(id)
+		build, err := s.getBuildForOwner(ownerID, id)
 		if err != nil {
 			http.Error(w, "build tidak ditemukan", 404)
 			return
@@ -837,7 +993,7 @@ func (s *Server) handleBuildRoutes(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method not allowed", 405)
 			return
 		}
-		if _, err := s.getBuild(id); err != nil {
+		if _, err := s.getBuildForOwner(ownerID, id); err != nil {
 			http.Error(w, "build tidak ditemukan", http.StatusNotFound)
 			return
 		}
@@ -847,7 +1003,7 @@ func (s *Server) handleBuildRoutes(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method not allowed", 405)
 			return
 		}
-		build, err := s.getBuild(id)
+		build, err := s.getBuildForOwner(ownerID, id)
 		if err != nil || build.Artifact == "" {
 			http.Error(w, "artifact belum tersedia", 404)
 			return
@@ -862,6 +1018,19 @@ func (s *Server) getBuild(id string) (Build, error) {
 	var b Build
 	var started, finished, errMsg, artifact sql.NullString
 	err := s.db.QueryRow(`SELECT id,project_id,status,variant,created_at,started_at,finished_at,error,artifact FROM builds WHERE id=?`, id).
+		Scan(&b.ID, &b.ProjectID, &b.Status, &b.Variant, &b.CreatedAt, &started, &finished, &errMsg, &artifact)
+	if err != nil {
+		return b, err
+	}
+	b.StartedAt, b.FinishedAt, b.Error, b.Artifact = started.String, finished.String, errMsg.String, artifact.String
+	return b, nil
+}
+
+func (s *Server) getBuildForOwner(ownerID, id string) (Build, error) {
+	var b Build
+	var started, finished, errMsg, artifact sql.NullString
+	err := s.db.QueryRow(`SELECT id,project_id,status,variant,created_at,started_at,finished_at,error,artifact
+		FROM builds WHERE id=? AND owner_id=?`, id, ownerID).
 		Scan(&b.ID, &b.ProjectID, &b.Status, &b.Variant, &b.CreatedAt, &started, &finished, &errMsg, &artifact)
 	if err != nil {
 		return b, err
@@ -1105,8 +1274,11 @@ func (s *Server) copyLogs(id, stream string, r io.ReadCloser) {
 
 func (s *Server) failBuild(id, message string) {
 	s.addLog(id, "system", "Build gagal: "+message)
-	s.db.Exec(`UPDATE builds SET status='failed',finished_at=?,error=? WHERE id=?`,
-		time.Now().UTC().Format(time.RFC3339), message, id)
+	now := time.Now().UTC().Format(time.RFC3339)
+	s.db.Exec(`UPDATE builds SET status='failed',finished_at=?,updated_at=?,error=? WHERE id=?`,
+		now, now, message, id)
+	s.db.Exec(`DELETE FROM build_manifests WHERE build_id=?`, id)
+	s.db.Exec(`DELETE FROM blob_reservations WHERE build_id=?`, id)
 }
 
 func findProjectRoot(workspace string) (string, error) {

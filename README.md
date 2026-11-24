@@ -1,6 +1,6 @@
 # App Builder
 
-App Builder is a self-hosted, mobile-friendly Android IDE. Projects are kept in the browser's IndexedDB; the server receives a ZIP snapshot only when a build is requested, then builds a debug APK in an isolated Docker container.
+App Builder is a self-hosted, mobile-friendly Android IDE. Projects are kept in the browser's IndexedDB; a build sends text files in its manifest and only uploads missing binary assets, then builds a debug APK in an isolated Docker container.
 
 The current MVP supports single-module Android projects using Kotlin or Java with XML Views, debug APK builds, ZIP import/export, a Monaco editor, persistent build history, build log streaming, and configurable public/private access. It does not currently support release signing, Compose, NDK, or multi-module projects.
 
@@ -97,8 +97,8 @@ IDE_CONFIG="$(pwd)/data/IDE.config" ./android-ide-server
 
 1. Create a Kotlin or Java Empty App, or import an Android Studio ZIP.
 2. Edit files in the browser; project files are saved in IndexedDB.
-3. Choose **Build APK**. The browser validates the project and uploads a ZIP snapshot.
-4. The API validates the archive and Android single-module structure.
+3. Choose **Build APK**. The browser hashes project files (caching hashes in IndexedDB until file contents change), sends a manifest, and uploads only binary assets missing from this browser's cache.
+4. The API verifies binary SHA-256 and size, assembles the Android project from text and owner-scoped immutable blobs, then validates the single-module structure.
 5. A Docker container runs Gradle `assembleDebug` with CPU, memory, process, and timeout limits.
 6. Logs and build status are stored by the API and can be restored after a page refresh or browser restart. Successful APKs are available from the build panel.
 
@@ -106,12 +106,13 @@ Each browser project has a stable ID. A second build for that project is rejecte
 
 ## Storage and cleanup
 
-- `DATA_DIR/workspaces/<build-id>` contains the uploaded ZIP and extracted Gradle workspace while a build is running. New builds remove their workspace when they finish; the cleanup UI can remove leftovers from earlier runs.
+- `DATA_DIR/workspaces/<build-id>` contains temporary upload data and the assembled Gradle workspace while a build is running. New builds remove their workspace when they finish; the cleanup UI can remove leftovers from earlier runs.
 - `DATA_DIR/artifacts/<build-id>.apk` contains successful APKs until they are explicitly deleted.
+- `DATA_DIR/blobs/sha256/<owner>/<prefix>/<sha256>` stores immutable binary assets scoped to an opaque per-browser cookie owner. Builds retain blob references while their history exists; deleting history releases refs and garbage-collects unreferenced blobs. Incomplete upload reservations expire after one hour.
 - `DATA_DIR/ide.db` stores build history and logs.
 - The Docker volume `androidide_gradle` stores downloaded Gradle and Maven dependencies. Deleting it saves disk space but the next build must download dependencies again.
 
-Open the drive icon in the web UI to inspect storage and choose what to remove. Active builds block cleanup. The history option also removes associated APKs and workspaces; browser projects in IndexedDB are not affected.
+Open the drive icon in the web UI to inspect storage and choose what to remove. Active builds block cleanup. The history option also removes associated APKs, workspaces, and unreferenced binary blobs; browser projects in IndexedDB are not affected.
 
 ## Security notes
 
