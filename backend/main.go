@@ -3,7 +3,10 @@ package main
 import (
 	"archive/zip"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,12 +37,15 @@ type Build struct {
 }
 
 type Server struct {
-	db          *sql.DB
-	dataDir     string
-	hostDataDir string
-	buildSlots  chan struct{}
-	buildMu     sync.Mutex
-	building    map[string]bool
+	db            *sql.DB
+	dataDir       string
+	hostDataDir   string
+	cleanupToken  string
+	buildSlots    chan struct{}
+	cacheSizeFn   func() (int64, error)
+	buildMu       sync.Mutex
+	maintenanceMu sync.Mutex
+	building      map[string]bool
 }
 
 func main() {
@@ -53,6 +59,10 @@ func main() {
 	if err := os.MkdirAll(filepath.Join(dataDir, "artifacts"), 0750); err != nil {
 		log.Fatal(err)
 	}
+	cleanupToken, err := loadOrCreateCleanupToken(dataDir)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	db, err := sql.Open("sqlite3", filepath.Join(dataDir, "ide.db"))
 	if err != nil {
@@ -63,12 +73,14 @@ func main() {
 
 	s := &Server{
 		db: db, dataDir: dataDir, hostDataDir: hostDataDir,
-		buildSlots: make(chan struct{}, 1), building: map[string]bool{},
+		cleanupToken: cleanupToken, buildSlots: make(chan struct{}, 1), building: map[string]bool{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/builds", s.handleBuildCollection)
 	mux.HandleFunc("/api/builds/", s.handleBuildRoutes)
+	mux.HandleFunc("/api/maintenance/storage", s.handleStorage)
+	mux.HandleFunc("/api/maintenance/cleanup", s.handleCleanup)
 	mux.Handle("/", http.FileServer(http.Dir(webDir)))
 
 	log.Printf("android web ide listening on http://0.0.0.0:%s", port)
@@ -112,6 +124,45 @@ func schema(db *sql.DB) {
 	}
 }
 
+func loadOrCreateCleanupToken(dataDir string) (string, error) {
+	if token := os.Getenv("CLEANUP_TOKEN"); token != "" {
+		return token, nil
+	}
+	path := filepath.Join(dataDir, "cleanup.token")
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(tokenBytes)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return "", err
+		}
+		existing, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return "", readErr
+		}
+		token = strings.TrimSpace(string(existing))
+		if token == "" {
+			return "", errors.New("cleanup token file kosong")
+		}
+	} else {
+		if _, err := file.WriteString(token + "\n"); err != nil {
+			file.Close()
+			os.Remove(path)
+			return "", err
+		}
+		if err := file.Close(); err != nil {
+			return "", err
+		}
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
 func env(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -122,7 +173,7 @@ func env(key, fallback string) string {
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Cleanup-Token")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -134,6 +185,293 @@ func withCORS(next http.Handler) http.Handler {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"ok": true, "service": "android-web-ide"})
+}
+
+type StorageStats struct {
+	WorkspaceBytes   int64 `json:"workspaceBytes"`
+	ArtifactBytes    int64 `json:"artifactBytes"`
+	DatabaseBytes    int64 `json:"databaseBytes"`
+	GradleCacheBytes int64 `json:"gradleCacheBytes"`
+	BuildHistory     int64 `json:"buildHistory"`
+	ActiveBuilds     int64 `json:"activeBuilds"`
+}
+
+type CleanupRequest struct {
+	Workspaces  bool `json:"workspaces"`
+	Artifacts   bool `json:"artifacts"`
+	History     bool `json:"history"`
+	GradleCache bool `json:"gradleCache"`
+}
+
+func (s *Server) handleStorage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.authorizedCleanupRequest(r) {
+		http.Error(w, "cleanup token tidak valid", http.StatusUnauthorized)
+		return
+	}
+	stats, err := s.storageStats()
+	if err != nil {
+		http.Error(w, "gagal membaca penggunaan storage: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
+func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.authorizedCleanupRequest(r) {
+		http.Error(w, "cleanup token tidak valid", http.StatusUnauthorized)
+		return
+	}
+	var request CleanupRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&request); err != nil {
+		http.Error(w, "request cleanup tidak valid", http.StatusBadRequest)
+		return
+	}
+	if !request.Workspaces && !request.Artifacts && !request.History && !request.GradleCache {
+		http.Error(w, "pilih setidaknya satu jenis data untuk dibersihkan", http.StatusBadRequest)
+		return
+	}
+
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	var active int64
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM builds WHERE status IN ('queued','building')`).Scan(&active); err != nil {
+		http.Error(w, "gagal memeriksa build aktif", http.StatusInternalServerError)
+		return
+	}
+	s.buildMu.Lock()
+	runners := len(s.building)
+	s.buildMu.Unlock()
+	if active > 0 || runners > 0 {
+		http.Error(w, "cleanup ditunda sampai semua build selesai", http.StatusConflict)
+		return
+	}
+
+	before, err := s.storageStats()
+	if err != nil {
+		http.Error(w, "gagal membaca penggunaan storage: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if request.History {
+		request.Workspaces, request.Artifacts = true, true
+	}
+	if request.Workspaces {
+		if err := removeDirectoryContents(filepath.Join(s.dataDir, "workspaces")); err != nil {
+			http.Error(w, "gagal menghapus workspace: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	if request.Artifacts {
+		if err := s.removeTerminalArtifacts(); err != nil {
+			http.Error(w, "gagal menghapus APK: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	if request.History {
+		if _, err := s.db.Exec(`DELETE FROM build_logs`); err != nil {
+			http.Error(w, "gagal menghapus log build", http.StatusInternalServerError)
+			return
+		}
+		if _, err := s.db.Exec(`DELETE FROM builds`); err != nil {
+			http.Error(w, "gagal menghapus riwayat build", http.StatusInternalServerError)
+			return
+		}
+		if _, err := s.db.Exec(`VACUUM`); err != nil {
+			http.Error(w, "gagal merapikan database: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	if request.GradleCache {
+		if err := clearGradleCache(); err != nil {
+			http.Error(w, "gagal menghapus cache Gradle: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	after, err := s.storageStats()
+	if err != nil {
+		http.Error(w, "cleanup selesai, tetapi gagal membaca penggunaan storage: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"removed": map[string]int64{
+			"workspaceBytes":   before.WorkspaceBytes - after.WorkspaceBytes,
+			"artifactBytes":    before.ArtifactBytes - after.ArtifactBytes,
+			"databaseBytes":    before.DatabaseBytes - after.DatabaseBytes,
+			"gradleCacheBytes": before.GradleCacheBytes - after.GradleCacheBytes,
+		},
+		"storage": after,
+	})
+}
+
+func (s *Server) authorizedCleanupRequest(r *http.Request) bool {
+	provided := r.Header.Get("X-Cleanup-Token")
+	return len(provided) == len(s.cleanupToken) &&
+		subtle.ConstantTimeCompare([]byte(provided), []byte(s.cleanupToken)) == 1
+}
+
+func (s *Server) storageStats() (StorageStats, error) {
+	var stats StorageStats
+	var err error
+	stats.WorkspaceBytes, err = directorySize(filepath.Join(s.dataDir, "workspaces"))
+	if err != nil {
+		return stats, err
+	}
+	stats.ArtifactBytes, err = directorySize(filepath.Join(s.dataDir, "artifacts"))
+	if err != nil {
+		return stats, err
+	}
+	for _, path := range []string{
+		filepath.Join(s.dataDir, "ide.db"),
+		filepath.Join(s.dataDir, "ide.db-wal"),
+		filepath.Join(s.dataDir, "ide.db-shm"),
+	} {
+		if info, statErr := os.Stat(path); statErr == nil && !info.IsDir() {
+			stats.DatabaseBytes += info.Size()
+		} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			return stats, statErr
+		}
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM builds`).Scan(&stats.BuildHistory); err != nil {
+		return stats, err
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM builds WHERE status IN ('queued','building')`).Scan(&stats.ActiveBuilds); err != nil {
+		return stats, err
+	}
+	cacheSizeFn := s.cacheSizeFn
+	if cacheSizeFn == nil {
+		cacheSizeFn = gradleCacheSize
+	}
+	stats.GradleCacheBytes, err = cacheSizeFn()
+	return stats, err
+}
+
+func directorySize(root string) (int64, error) {
+	var size int64
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if entry.Type().IsRegular() {
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			size += info.Size()
+		}
+		return nil
+	})
+	return size, err
+}
+
+func removeDirectoryContents(root string) error {
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) removeTerminalArtifacts() error {
+	rows, err := s.db.Query(`SELECT id,artifact FROM builds WHERE status NOT IN ('queued','building') AND artifact IS NOT NULL`)
+	if err != nil {
+		return err
+	}
+	type artifactRecord struct{ id, filename string }
+	var artifacts []artifactRecord
+	for rows.Next() {
+		var item artifactRecord
+		if err := rows.Scan(&item.id, &item.filename); err != nil {
+			rows.Close()
+			return err
+		}
+		artifacts = append(artifacts, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, item := range artifacts {
+		if item.filename != item.id+".apk" || filepath.Base(item.filename) != item.filename {
+			return fmt.Errorf("nama artifact build %s tidak valid", item.id)
+		}
+		if err := os.Remove(filepath.Join(s.dataDir, "artifacts", item.filename)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if _, err := s.db.Exec(`UPDATE builds SET artifact=NULL WHERE id=?`, item.id); err != nil {
+			return err
+		}
+	}
+	return removeDirectoryContents(filepath.Join(s.dataDir, "artifacts"))
+}
+
+func gradleCacheSize() (int64, error) {
+	found, err := gradleCacheExists()
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 0, nil
+	}
+	out, err := exec.Command("docker", "run", "--rm", "-v", "androidide_gradle:/cache", "--entrypoint", "du",
+		"android-web-ide-builder", "-sb", "/cache").Output()
+	if err != nil {
+		return 0, err
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return 0, errors.New("output ukuran cache Gradle kosong")
+	}
+	var size int64
+	if _, err := fmt.Sscan(fields[0], &size); err != nil {
+		return 0, err
+	}
+	return size, nil
+}
+
+func clearGradleCache() error {
+	found, err := gradleCacheExists()
+	if err != nil || !found {
+		return err
+	}
+	out, err := exec.Command("docker", "volume", "rm", "androidide_gradle").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
+func gradleCacheExists() (bool, error) {
+	out, err := exec.Command("docker", "volume", "ls", "--format", "{{.Name}}", "--filter", "name=androidide_gradle").Output()
+	if err != nil {
+		return false, err
+	}
+	for _, name := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if name == "androidide_gradle" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *Server) handleBuildCollection(w http.ResponseWriter, r *http.Request) {
@@ -198,6 +536,8 @@ func (s *Server) handleBuildCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "projectId wajib berupa ID project yang valid", http.StatusBadRequest)
 		return
 	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
 	if b, err := s.getActiveBuild(projectID); err == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
@@ -478,9 +818,11 @@ func fileExists(path string) bool {
 }
 
 func (s *Server) runBuild(id, workspace string) {
-	s.buildSlots <- struct{}{}
-	defer func() { <-s.buildSlots }()
-
+	defer func() {
+		if err := os.RemoveAll(workspace); err != nil {
+			log.Printf("failed to remove build workspace %s: %v", id, err)
+		}
+	}()
 	s.buildMu.Lock()
 	if s.building[id] {
 		s.buildMu.Unlock()
@@ -489,6 +831,9 @@ func (s *Server) runBuild(id, workspace string) {
 	s.building[id] = true
 	s.buildMu.Unlock()
 	defer func() { s.buildMu.Lock(); delete(s.building, id); s.buildMu.Unlock() }()
+
+	s.buildSlots <- struct{}{}
+	defer func() { <-s.buildSlots }()
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	s.db.Exec(`UPDATE builds SET status='building',started_at=? WHERE id=?`, now, id)
@@ -549,9 +894,9 @@ func (s *Server) runBuild(id, workspace string) {
 	io.Copy(output, input)
 	input.Close()
 	output.Close()
+	s.addLog(id, "system", "APK berhasil dibuild")
 	s.db.Exec(`UPDATE builds SET status='success',finished_at=?,artifact=? WHERE id=?`,
 		time.Now().UTC().Format(time.RFC3339), filename, id)
-	s.addLog(id, "system", "APK berhasil dibuild")
 }
 
 func (s *Server) copyLogs(id, stream string, r io.ReadCloser) {
@@ -583,9 +928,9 @@ func (s *Server) copyLogs(id, stream string, r io.ReadCloser) {
 }
 
 func (s *Server) failBuild(id, message string) {
+	s.addLog(id, "system", "Build gagal: "+message)
 	s.db.Exec(`UPDATE builds SET status='failed',finished_at=?,error=? WHERE id=?`,
 		time.Now().UTC().Format(time.RFC3339), message, id)
-	s.addLog(id, "system", "Build gagal: "+message)
 }
 
 func findProjectRoot(workspace string) (string, error) {

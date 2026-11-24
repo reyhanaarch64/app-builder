@@ -3,7 +3,7 @@ import Editor from '@monaco-editor/react'
 import Dexie, { type Table } from 'dexie'
 import JSZip from 'jszip'
 import {
-  Box, ChevronRight, Download, FileCode2, FilePlus2, FolderPlus,
+  Box, ChevronRight, Download, FileCode2, FilePlus2, FolderPlus, HardDrive,
   Menu, PackagePlus, Play, Search, Trash2, Upload,
   X,
 } from 'lucide-react'
@@ -41,6 +41,22 @@ type Build = {
   createdAt: string
   error?: string
   artifact?: string
+}
+
+type StorageStats = {
+  workspaceBytes: number
+  artifactBytes: number
+  databaseBytes: number
+  gradleCacheBytes: number
+  buildHistory: number
+  activeBuilds: number
+}
+
+type CleanupOptions = {
+  workspaces: boolean
+  artifacts: boolean
+  history: boolean
+  gradleCache: boolean
 }
 
 class IDEDatabase extends Dexie {
@@ -143,6 +159,18 @@ function validateBuildProject(project: Project, files: ProjectFile[]): string | 
   return null
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let value = bytes / 1024
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit++
+  }
+  return `${value.toFixed(1)} ${units[unit]}`
+}
+
 async function ensureGeneratedJvmTargets(project: Project, files: ProjectFile[]): Promise<ProjectFile[]> {
   if (project.templateId !== 'empty-app') return files
   const moduleFile = files.find(file => /(^|\/)app\/build\.gradle\.kts$/.test(file.path))
@@ -182,6 +210,13 @@ function App() {
   const [search, setSearch] = useState('')
   const [expanded, setExpanded] = useState<Set<string>>(new Set(['app', 'app/src', 'app/src/main']))
   const [toast, setToast] = useState('')
+  const [storageOpen, setStorageOpen] = useState(false)
+  const [storageLoading, setStorageLoading] = useState(false)
+  const [storageStats, setStorageStats] = useState<StorageStats | null>(null)
+  const [cleanupToken, setCleanupToken] = useState('')
+  const [cleanupOptions, setCleanupOptions] = useState<CleanupOptions>({
+    workspaces: true, artifacts: true, history: false, gradleCache: false,
+  })
   const autoSaveTimers = useRef(new Map<string, number>())
   const buildEvents = useRef<EventSource | null>(null)
   const [buildHistory, setBuildHistory] = useState<Build[]>([])
@@ -256,6 +291,74 @@ function App() {
   const tree = useMemo(() => buildTree(
     search ? files.filter(f => f.path.toLowerCase().includes(search.toLowerCase())) : files
   ), [files, search])
+
+  async function refreshStorageStats() {
+    if (!cleanupToken.trim()) {
+      setToast('Masukkan cleanup token untuk membaca storage')
+      return
+    }
+    setStorageLoading(true)
+    try {
+      const response = await fetch('/api/maintenance/storage', {
+        headers: { 'X-Cleanup-Token': cleanupToken },
+      })
+      if (!response.ok) throw new Error(await response.text())
+      setStorageStats(await response.json() as StorageStats)
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'gagal membaca penggunaan storage')
+    } finally {
+      setStorageLoading(false)
+    }
+  }
+
+  function openStorage() {
+    setStorageOpen(true)
+  }
+
+  async function cleanStorage() {
+    if (!cleanupToken.trim()) {
+      setToast('Masukkan cleanup token dari file DATA_DIR/cleanup.token')
+      return
+    }
+    if (!Object.values(cleanupOptions).some(Boolean)) {
+      setToast('Pilih data yang mau dibersihkan')
+      return
+    }
+    const confirmed = confirm(
+      `Lanjut bersihkan storage?${cleanupOptions.history ? '\nRiwayat dan semua log build akan dihapus.' : ''}${cleanupOptions.artifacts || cleanupOptions.history ? '\nAPK hasil build yang dipilih akan dihapus.' : ''}${cleanupOptions.gradleCache ? '\nCache Gradle dihapus dan perlu diunduh ulang saat build berikutnya.' : ''}`,
+    )
+    if (!confirmed) return
+    setStorageLoading(true)
+    try {
+      const response = await fetch('/api/maintenance/cleanup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Cleanup-Token': cleanupToken },
+        body: JSON.stringify(cleanupOptions),
+      })
+      const body = await response.text()
+      let data: { error?: string; removed?: Record<string, number>; storage?: StorageStats }
+      try { data = JSON.parse(body) as typeof data }
+      catch { data = { error: body } }
+      if (!response.ok) throw new Error(data.error || `cleanup gagal (${response.status})`)
+      setStorageStats(data.storage ?? null)
+      setCleanupToken('')
+      setToast(`storage dibersihkan: ${formatBytes(Object.values(data.removed ?? {}).reduce((sum, size) => sum + size, 0))} dibebaskan`)
+      if (cleanupOptions.history) {
+        setBuildHistory([])
+        setBuildId(null)
+        setBuildStatus('idle')
+        setLogs([])
+        setBuildOpen(false)
+      } else if (activeProjectId) {
+        const historyResponse = await fetch(`/api/builds?projectId=${encodeURIComponent(activeProjectId)}`)
+        if (historyResponse.ok) setBuildHistory(await historyResponse.json() as Build[])
+      }
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'cleanup gagal')
+    } finally {
+      setStorageLoading(false)
+    }
+  }
 
   async function createProject(data: Omit<Project, 'id' | 'createdAt' | 'updatedAt' | 'templateId'>) {
     const now = Date.now()
@@ -503,6 +606,7 @@ function App() {
         <button className="build-btn" onClick={startBuild} disabled={!activeProject || buildStatus === 'queued' || buildStatus === 'building'}>
           <Play size={16} fill="currentColor"/><span>{buildStatus === 'queued' || buildStatus === 'building' ? 'Building...' : 'Build APK'}</span>
         </button>
+        <button className="icon-btn storage-btn" title="Kelola storage build" onClick={openStorage}><HardDrive size={18}/></button>
       </header>
 
       <aside className={`sidebar ${drawerOpen ? 'open' : ''}`}>
@@ -589,10 +693,65 @@ function App() {
           }}>{buildHistory.map(build => <option key={build.id} value={build.id}>{build.status} · {new Date(build.createdAt).toLocaleString()}</option>)}</select></label></div>}
           <div className={`status-line ${buildStatus}`}><span></span>{buildStatus === 'building' ? 'Building...' : buildStatus === 'success' ? 'Build berhasil' : buildStatus === 'failed' ? 'Build gagal' : buildStatus === 'canceled' ? 'Build dibatalkan' : 'Menunggu worker'}</div>
           <div className="log-view">{logs.map((line, i) => <div key={i}><span>{String(i + 1).padStart(3, '0')}</span>{line}</div>)}</div>
-          {buildStatus === 'success' && buildId && <a className="download-btn" href={`/api/builds/${buildId}/artifact`} download><Download size={17}/>Download APK</a>}
+          {buildStatus === 'success' && buildId && buildHistory.find(build => build.id === buildId)?.artifact &&
+            <a className="download-btn" href={`/api/builds/${buildId}/artifact`} download><Download size={17}/>Download APK</a>}
         </div>
       )}
+      {storageOpen && (
+        <StorageDialog
+          stats={storageStats}
+          loading={storageLoading}
+          token={cleanupToken}
+          options={cleanupOptions}
+          onTokenChange={setCleanupToken}
+          onOptionChange={(key, checked) => setCleanupOptions(prev => ({ ...prev, [key]: checked }))}
+          onRefresh={() => void refreshStorageStats()}
+          onCleanup={cleanStorage}
+          onClose={() => setStorageOpen(false)}
+        />
+      )}
       {toast && <div className="toast">{toast}</div>}
+    </div>
+  )
+}
+
+function StorageDialog({ stats, loading, token, options, onTokenChange, onOptionChange, onRefresh, onCleanup, onClose }: {
+  stats: StorageStats | null
+  loading: boolean
+  token: string
+  options: CleanupOptions
+  onTokenChange: (value: string) => void
+  onOptionChange: (key: keyof CleanupOptions, checked: boolean) => void
+  onRefresh: () => void
+  onCleanup: () => void
+  onClose: () => void
+}) {
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <div className="modal storage-modal" onMouseDown={event => event.stopPropagation()}>
+        <div className="modal-head">
+          <div><small>SERVER STORAGE</small><h2>Build cache &amp; data</h2></div>
+          <button className="icon-btn" onClick={onClose}><X size={18}/></button>
+        </div>
+        <div className="storage-stats">
+          <div><span>Build workspaces</span><strong>{stats ? formatBytes(stats.workspaceBytes) : '—'}</strong></div>
+          <div><span>APK artifacts</span><strong>{stats ? formatBytes(stats.artifactBytes) : '—'}</strong></div>
+          <div><span>Gradle cache · Docker volume</span><strong>{stats ? formatBytes(stats.gradleCacheBytes) : '—'}</strong></div>
+          <div><span>Database · {stats?.buildHistory ?? 0} build records</span><strong>{stats ? formatBytes(stats.databaseBytes) : '—'}</strong></div>
+        </div>
+        <p className="storage-paths">lokasi: <code>DATA_DIR/workspaces</code>, <code>DATA_DIR/artifacts</code>, dan volume <code>androidide_gradle</code>. project di IndexedDB browser tidak ikut dihapus.</p>
+        <div className="cleanup-options">
+          <label><input type="checkbox" checked={options.workspaces} onChange={event => onOptionChange('workspaces', event.target.checked)}/><span><strong>workspace lama</strong><small>hapus source ZIP dan output build yang tertinggal</small></span></label>
+          <label><input type="checkbox" checked={options.artifacts} onChange={event => onOptionChange('artifacts', event.target.checked)}/><span><strong>APK artifacts</strong><small>APK terhapus dan tidak bisa didownload lagi</small></span></label>
+          <label><input type="checkbox" checked={options.history} onChange={event => onOptionChange('history', event.target.checked)}/><span><strong>riwayat dan log build</strong><small>juga menghapus workspace serta APK terkait</small></span></label>
+          <label><input type="checkbox" checked={options.gradleCache} onChange={event => onOptionChange('gradleCache', event.target.checked)}/><span><strong>Gradle dependency cache</strong><small>build berikutnya perlu download dependency lagi</small></span></label>
+        </div>
+        <label className="cleanup-token">cleanup token<input type="password" autoComplete="off" value={token} onChange={event => onTokenChange(event.target.value)} placeholder="CLEANUP_TOKEN atau DATA_DIR/cleanup.token"/></label>
+        <div className="storage-actions">
+          <button className="tool-btn refresh-storage" onClick={onRefresh} disabled={loading}>{loading ? 'memuat…' : 'refresh ukuran'}</button>
+          <button className="danger-btn" onClick={onCleanup} disabled={loading}>{loading ? 'membersihkan…' : 'bersihkan yang dipilih'}</button>
+        </div>
+      </div>
     </div>
   )
 }

@@ -75,6 +75,17 @@ PORT=8866 ./android-ide-server
 
 Each browser project has a stable ID. A second build for that project is rejected while its first build is queued or running; builds are also serialized globally. Once a build reaches a terminal state, that project can be built again.
 
+## Storage and cleanup
+
+- `DATA_DIR/workspaces/<build-id>` contains the uploaded ZIP and extracted Gradle workspace while a build is running. New builds remove their workspace when they finish; the cleanup UI can remove leftovers from earlier runs.
+- `DATA_DIR/artifacts/<build-id>.apk` contains successful APKs until they are explicitly deleted.
+- `DATA_DIR/ide.db` stores build history and logs.
+- The Docker volume `androidide_gradle` stores downloaded Gradle and Maven dependencies. Deleting it saves disk space but the next build must download dependencies again.
+
+Open the drive icon in the web UI to inspect storage and choose what to remove. Active builds block cleanup. The history option also removes associated APKs and workspaces; browser projects in IndexedDB are not affected.
+
+Cleanup and storage inspection require an admin token. On first start the server creates `DATA_DIR/cleanup.token` with file permissions `0600`; read it on the VPS and enter it in the UI. Alternatively, set `CLEANUP_TOKEN` in the server environment. The token is not returned by the API and should not be committed or shared.
+
 ## Security notes
 
 **Do not expose this service directly to the public internet as-is.** The current MVP does not implement user authentication or authorization. Anyone who can reach the API can submit build jobs and consume server resources. Build scripts are untrusted input even though they run in a separate container. Restrict access with a trusted network, VPN, firewall, or an authenticated reverse proxy.
