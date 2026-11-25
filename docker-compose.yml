@@ -12,4 +12,6 @@ services:
     volumes:
       - ./data:/data
       - /var/run/docker.sock:/var/run/docker.sock
+      - /proc/stat:/host-metrics/stat:ro
+      - /proc/meminfo:/host-metrics/meminfo:ro
     restart: unless-stopped

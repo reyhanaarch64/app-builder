@@ -26,15 +26,16 @@ import (
 )
 
 type Build struct {
-	ID         string `json:"id"`
-	ProjectID  string `json:"projectId"`
-	Status     string `json:"status"`
-	Variant    string `json:"variant"`
-	CreatedAt  string `json:"createdAt"`
-	StartedAt  string `json:"startedAt,omitempty"`
-	FinishedAt string `json:"finishedAt,omitempty"`
-	Error      string `json:"error,omitempty"`
-	Artifact   string `json:"artifact,omitempty"`
+	ID          string `json:"id"`
+	ProjectID   string `json:"projectId"`
+	ProjectType string `json:"projectType,omitempty"`
+	Status      string `json:"status"`
+	Variant     string `json:"variant"`
+	CreatedAt   string `json:"createdAt"`
+	StartedAt   string `json:"startedAt,omitempty"`
+	FinishedAt  string `json:"finishedAt,omitempty"`
+	Error       string `json:"error,omitempty"`
+	Artifact    string `json:"artifact,omitempty"`
 }
 
 type BuildConfig struct {
@@ -72,22 +73,27 @@ type loginAttempts struct {
 }
 
 type Server struct {
-	db            *sql.DB
-	dataDir       string
-	hostDataDir   string
-	config        AppConfig
-	buildSlots    chan struct{}
-	cacheSizeFn   func() (int64, error)
-	buildMu       sync.Mutex
-	maintenanceMu sync.Mutex
-	building      map[string]bool
-	buildCancels  map[string]context.CancelFunc
-	startBuildFn  func(string, string)
-	ownerMu       sync.Mutex
-	sessionMu     sync.Mutex
-	sessions      map[string]session
-	loginMu       sync.Mutex
-	loginFailures map[string]loginAttempts
+	db             *sql.DB
+	dataDir        string
+	hostDataDir    string
+	hostMetricsDir string
+	config         AppConfig
+	buildSlots     chan struct{}
+	cacheSizeFn    func() (int64, error)
+	buildMu        sync.Mutex
+	maintenanceMu  sync.Mutex
+	building       map[string]bool
+	buildCancels   map[string]context.CancelFunc
+	startBuildFn   func(string, string)
+	ownerMu        sync.Mutex
+	sessionMu      sync.Mutex
+	sessions       map[string]session
+	loginMu        sync.Mutex
+	loginFailures  map[string]loginAttempts
+	monitorMu      sync.RWMutex
+	hostMetrics    HostResourceMetrics
+	hostMetricsOK  bool
+	buildMetrics   map[string]BuildResourceMetrics
 }
 
 func main() {
@@ -103,6 +109,11 @@ func main() {
 	}
 	if err := os.MkdirAll(filepath.Join(dataDir, "blobs"), 0700); err != nil {
 		log.Fatal(err)
+	}
+	for _, directory := range []string{"workspaces", "artifacts", "blobs", "gradle"} {
+		if err := os.MkdirAll(filepath.Join(dataDir, "public", directory), 0700); err != nil {
+			log.Fatal(err)
+		}
 	}
 	if err := os.RemoveAll(filepath.Join(dataDir, "signing")); err != nil {
 		log.Fatal(err)
@@ -120,11 +131,15 @@ func main() {
 	schema(db)
 
 	s := &Server{
-		db: db, dataDir: dataDir, hostDataDir: hostDataDir, config: config,
+		db: db, dataDir: dataDir, hostDataDir: hostDataDir, hostMetricsDir: "/host-metrics", config: config,
 		buildSlots: make(chan struct{}, config.Build.Parallel), building: map[string]bool{},
 		sessions: make(map[string]session), loginFailures: make(map[string]loginAttempts),
+		buildMetrics: make(map[string]BuildResourceMetrics),
 	}
 	go s.runBlobGC()
+	if config.Mode == "private" {
+		go s.runHostMetricsSampler()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/api/auth/status", s.handleAuthStatus)
@@ -133,6 +148,10 @@ func main() {
 	mux.HandleFunc("/api/notifications/settings", s.handleNotificationSettings)
 	mux.HandleFunc("/api/artifacts", s.handleArtifactRoutes)
 	mux.HandleFunc("/api/artifacts/", s.handleArtifactRoutes)
+	mux.HandleFunc("/api/import/github", s.handleGitHubImport)
+	mux.HandleFunc("/api/builds/active", s.handleActiveBuilds)
+	mux.HandleFunc("/api/monitor/host", s.handleHostMonitor)
+	mux.HandleFunc("/api/monitor/builds/", s.handleBuildMonitor)
 	mux.HandleFunc("/api/builds", s.handleBuildCollection)
 	mux.HandleFunc("/api/builds/prepare", s.handleBuildPrepare)
 	mux.HandleFunc("/api/builds/", s.handleBuildRoutes)
@@ -167,7 +186,9 @@ func schema(db *sql.DB) {
 		started_at TEXT,
 		finished_at TEXT,
 		error TEXT,
-		artifact TEXT
+		artifact TEXT,
+		access_mode TEXT NOT NULL DEFAULT 'private',
+		blob_owner_id TEXT NOT NULL DEFAULT ''
 	); CREATE TABLE IF NOT EXISTS build_logs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		build_id TEXT NOT NULL,
@@ -220,6 +241,8 @@ func schema(db *sql.DB) {
 		"idempotency_key": "TEXT NOT NULL DEFAULT ''",
 		"manifest_hash":   "TEXT NOT NULL DEFAULT ''",
 		"updated_at":      "TEXT NOT NULL DEFAULT ''",
+		"access_mode":     "TEXT NOT NULL DEFAULT 'private'",
+		"blob_owner_id":   "TEXT NOT NULL DEFAULT ''",
 	} {
 		var count int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('builds') WHERE name=?`, column).Scan(&count); err != nil {
@@ -270,6 +293,10 @@ func schema(db *sql.DB) {
 	}
 	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS builds_one_request_per_owner
 		ON builds(owner_id,idempotency_key) WHERE idempotency_key != ''`); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS builds_public_idle
+		ON builds(updated_at) WHERE access_mode='public'`); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -344,6 +371,80 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"ok": true, "service": "android-web-ide"})
 }
 
+func (s *Server) workspacePath(buildID, mode string) string {
+	if mode == "public" {
+		return filepath.Join(s.dataDir, "public", "workspaces", buildID)
+	}
+	return filepath.Join(s.dataDir, "workspaces", buildID)
+}
+
+func artifactExtension(variant string) (string, error) {
+	switch variant {
+	case "debug", "release":
+		return ".apk", nil
+	case "jar", "fat-jar":
+		return ".jar", nil
+	default:
+		return "", fmt.Errorf("variant artifact tidak valid: %s", variant)
+	}
+}
+
+func artifactFilename(buildID, variant string) (string, error) {
+	if filepath.Base(buildID) != buildID || buildID == "" {
+		return "", errors.New("build ID artifact tidak valid")
+	}
+	extension, err := artifactExtension(variant)
+	if err != nil {
+		return "", err
+	}
+	return buildID + extension, nil
+}
+
+func buildProjectType(variant string) string {
+	if variant == "jar" || variant == "fat-jar" {
+		return "java-library"
+	}
+	return "android"
+}
+
+func (s *Server) artifactPath(buildID, mode string, variants ...string) string {
+	variant := "debug"
+	if len(variants) > 0 {
+		variant = variants[0]
+	}
+	extension, err := artifactExtension(variant)
+	if err != nil {
+		extension = ".invalid"
+	}
+	filename := buildID + extension
+	if mode == "public" {
+		return filepath.Join(s.dataDir, "public", "artifacts", filename)
+	}
+	return filepath.Join(s.dataDir, "artifacts", filename)
+}
+
+func (s *Server) buildStorage(buildID string) (string, string, error) {
+	var mode, blobOwnerID, ownerID string
+	err := s.db.QueryRow(`SELECT access_mode,blob_owner_id,owner_id FROM builds WHERE id=?`, buildID).
+		Scan(&mode, &blobOwnerID, &ownerID)
+	if err != nil {
+		return "", "", err
+	}
+	if mode != "public" {
+		mode = "private"
+	}
+	if blobOwnerID == "" {
+		blobOwnerID = ownerID
+	}
+	return mode, blobOwnerID, nil
+}
+
+func (s *Server) touchPublicBuild(buildID string) error {
+	_, err := s.db.Exec(`UPDATE builds SET updated_at=? WHERE id=? AND access_mode='public'`,
+		time.Now().UTC().Format(time.RFC3339), buildID)
+	return err
+}
+
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		isAPI := strings.HasPrefix(r.URL.Path, "/api/")
@@ -353,8 +454,9 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		if s.config.Mode == "private" && isAPI &&
 			r.URL.Path != "/api/auth/status" && r.URL.Path != "/api/auth/login" &&
 			r.URL.Path != "/api/auth/logout" && r.URL.Path != "/api/health" &&
+			!strings.HasPrefix(r.URL.Path, "/api/monitor/") &&
 			!s.hasValidSession(r) {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "login required"})
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Autentikasi diperlukan."})
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -363,11 +465,11 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Metode HTTP tidak diizinkan.", http.StatusMethodNotAllowed)
 		return
 	}
-	if _, err := s.ensureOwner(w, r); err != nil {
-		http.Error(w, "gagal membuat identitas browser", http.StatusInternalServerError)
+	if _, err := s.requestOwner(w, r); err != nil {
+		http.Error(w, "Gagal membuat identitas peramban.", http.StatusInternalServerError)
 		return
 	}
 	authenticated := s.config.Mode == "public" || s.hasValidSession(r)
@@ -376,16 +478,16 @@ func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Metode HTTP tidak diizinkan.", http.StatusMethodNotAllowed)
 		return
 	}
 	if s.config.Mode != "private" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "private mode is disabled"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Mode privat tidak aktif."})
 		return
 	}
 	ip := clientIP(r)
 	if s.isLoginRateLimited(ip) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "terlalu banyak percobaan login; coba lagi dalam 15 menit"})
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "Terlalu banyak percobaan masuk. Coba lagi dalam 15 menit."})
 		return
 	}
 	var body struct {
@@ -393,19 +495,19 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
 		s.recordLoginFailure(ip)
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request login tidak valid"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Permintaan masuk tidak valid."})
 		return
 	}
 	if len(body.Password) != len(s.config.Password) ||
 		subtle.ConstantTimeCompare([]byte(body.Password), []byte(s.config.Password)) != 1 {
 		s.recordLoginFailure(ip)
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "password salah"})
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Kata sandi salah."})
 		return
 	}
 	s.clearLoginFailures(ip)
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "gagal membuat session"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Gagal membuat sesi."})
 		return
 	}
 	token := hex.EncodeToString(tokenBytes)
@@ -423,7 +525,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Metode HTTP tidak diizinkan.", http.StatusMethodNotAllowed)
 		return
 	}
 	if cookie, err := r.Cookie("ide_session"); err == nil {
@@ -518,12 +620,12 @@ type CleanupRequest struct {
 
 func (s *Server) handleStorage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Metode HTTP tidak diizinkan.", http.StatusMethodNotAllowed)
 		return
 	}
 	stats, err := s.storageStats()
 	if err != nil {
-		http.Error(w, "gagal membaca penggunaan storage: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Gagal membaca penggunaan penyimpanan: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -532,16 +634,16 @@ func (s *Server) handleStorage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Metode HTTP tidak diizinkan.", http.StatusMethodNotAllowed)
 		return
 	}
 	var request CleanupRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&request); err != nil {
-		http.Error(w, "request cleanup tidak valid", http.StatusBadRequest)
+		http.Error(w, "Permintaan pembersihan tidak valid.", http.StatusBadRequest)
 		return
 	}
 	if !request.Workspaces && !request.Artifacts && !request.History && !request.GradleCache {
-		http.Error(w, "pilih setidaknya satu jenis data untuk dibersihkan", http.StatusBadRequest)
+		http.Error(w, "Pilih setidaknya satu jenis data untuk dibersihkan.", http.StatusBadRequest)
 		return
 	}
 
@@ -549,20 +651,20 @@ func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
 	defer s.maintenanceMu.Unlock()
 	var active int64
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM builds WHERE status IN ('preparing','assembling','queued','building')`).Scan(&active); err != nil {
-		http.Error(w, "gagal memeriksa build aktif", http.StatusInternalServerError)
+		http.Error(w, "Gagal memeriksa build aktif.", http.StatusInternalServerError)
 		return
 	}
 	s.buildMu.Lock()
 	runners := len(s.building)
 	s.buildMu.Unlock()
 	if active > 0 || runners > 0 {
-		http.Error(w, "cleanup ditunda sampai semua build selesai", http.StatusConflict)
+		http.Error(w, "Pembersihan ditunda hingga semua build selesai.", http.StatusConflict)
 		return
 	}
 
 	before, err := s.storageStats()
 	if err != nil {
-		http.Error(w, "gagal membaca penggunaan storage: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Gagal membaca penggunaan penyimpanan: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if request.History {
@@ -570,59 +672,75 @@ func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
 	}
 	if request.Workspaces {
 		if err := removeDirectoryContents(filepath.Join(s.dataDir, "workspaces")); err != nil {
-			http.Error(w, "gagal menghapus workspace: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Gagal menghapus ruang kerja: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := removeDirectoryContents(filepath.Join(s.dataDir, "public", "workspaces")); err != nil {
+			http.Error(w, "Gagal menghapus ruang kerja publik: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
 	if request.Artifacts {
 		if err := s.removeTerminalArtifacts(); err != nil {
-			http.Error(w, "gagal menghapus APK: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Gagal menghapus APK: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
 	if request.History {
 		if err := s.releaseAllBuildBlobRefs(); err != nil {
-			http.Error(w, "gagal melepas referensi binary cache: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Gagal melepas referensi cache berkas biner: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		if err := s.collectExpiredBlobReservations(); err != nil {
-			http.Error(w, "gagal membersihkan binary cache: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Gagal membersihkan cache berkas biner: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		if _, err := s.db.Exec(`DELETE FROM build_manifests`); err != nil {
-			http.Error(w, "gagal menghapus manifest build", http.StatusInternalServerError)
+			http.Error(w, "Gagal menghapus manifest build.", http.StatusInternalServerError)
 			return
 		}
 		if _, err := s.db.Exec(`DELETE FROM blob_reservations`); err != nil {
-			http.Error(w, "gagal menghapus reservation binary", http.StatusInternalServerError)
+			http.Error(w, "Gagal menghapus reservasi berkas biner.", http.StatusInternalServerError)
 			return
 		}
 		if err := removeDirectoryContents(filepath.Join(s.dataDir, "blobs", "sha256")); err != nil {
-			http.Error(w, "gagal menghapus blob cache: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Gagal menghapus cache blob: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := removeDirectoryContents(filepath.Join(s.dataDir, "public", "blobs", "sha256")); err != nil {
+			http.Error(w, "Gagal menghapus cache blob publik: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := removeDirectoryContents(filepath.Join(s.dataDir, "public", "gradle")); err != nil {
+			http.Error(w, "Gagal menghapus cache Gradle publik: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		if _, err := s.db.Exec(`DELETE FROM build_logs`); err != nil {
-			http.Error(w, "gagal menghapus log build", http.StatusInternalServerError)
+			http.Error(w, "Gagal menghapus log build.", http.StatusInternalServerError)
 			return
 		}
 		if _, err := s.db.Exec(`DELETE FROM builds`); err != nil {
-			http.Error(w, "gagal menghapus riwayat build", http.StatusInternalServerError)
+			http.Error(w, "Gagal menghapus riwayat build.", http.StatusInternalServerError)
 			return
 		}
 		if _, err := s.db.Exec(`VACUUM`); err != nil {
-			http.Error(w, "gagal merapikan database: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Gagal merapikan basis data: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
 	if request.GradleCache {
 		if err := clearGradleCache(); err != nil {
-			http.Error(w, "gagal menghapus cache Gradle: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Gagal menghapus cache Gradle: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := removeDirectoryContents(filepath.Join(s.dataDir, "public", "gradle")); err != nil {
+			http.Error(w, "Gagal menghapus cache Gradle publik: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
 	after, err := s.storageStats()
 	if err != nil {
-		http.Error(w, "cleanup selesai, tetapi gagal membaca penggunaan storage: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Pembersihan selesai, tetapi gagal membaca penggunaan penyimpanan: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -641,17 +759,22 @@ func (s *Server) handleCleanup(w http.ResponseWriter, r *http.Request) {
 func (s *Server) storageStats() (StorageStats, error) {
 	var stats StorageStats
 	var err error
-	stats.WorkspaceBytes, err = directorySize(filepath.Join(s.dataDir, "workspaces"))
-	if err != nil {
-		return stats, err
-	}
-	stats.ArtifactBytes, err = directorySize(filepath.Join(s.dataDir, "artifacts"))
-	if err != nil {
-		return stats, err
-	}
-	stats.BlobBytes, err = directorySize(filepath.Join(s.dataDir, "blobs", "sha256"))
-	if err != nil {
-		return stats, err
+	for _, item := range []struct {
+		target *int64
+		path   string
+	}{
+		{&stats.WorkspaceBytes, filepath.Join(s.dataDir, "workspaces")},
+		{&stats.WorkspaceBytes, filepath.Join(s.dataDir, "public", "workspaces")},
+		{&stats.ArtifactBytes, filepath.Join(s.dataDir, "artifacts")},
+		{&stats.ArtifactBytes, filepath.Join(s.dataDir, "public", "artifacts")},
+		{&stats.BlobBytes, filepath.Join(s.dataDir, "blobs", "sha256")},
+		{&stats.BlobBytes, filepath.Join(s.dataDir, "public", "blobs", "sha256")},
+	} {
+		size, err := directorySize(item.path)
+		if err != nil {
+			return stats, err
+		}
+		*item.target += size
 	}
 	for _, path := range []string{
 		filepath.Join(s.dataDir, "ide.db"),
@@ -675,6 +798,11 @@ func (s *Server) storageStats() (StorageStats, error) {
 		cacheSizeFn = gradleCacheSize
 	}
 	stats.GradleCacheBytes, err = cacheSizeFn()
+	if err != nil {
+		return stats, err
+	}
+	publicGradleBytes, err := directorySize(filepath.Join(s.dataDir, "public", "gradle"))
+	stats.GradleCacheBytes += publicGradleBytes
 	return stats, err
 }
 
@@ -716,15 +844,15 @@ func removeDirectoryContents(root string) error {
 }
 
 func (s *Server) removeTerminalArtifacts() error {
-	rows, err := s.db.Query(`SELECT id,artifact FROM builds WHERE status NOT IN ('queued','building') AND artifact IS NOT NULL`)
+	rows, err := s.db.Query(`SELECT id,variant,artifact,access_mode FROM builds WHERE status NOT IN ('queued','building') AND artifact IS NOT NULL`)
 	if err != nil {
 		return err
 	}
-	type artifactRecord struct{ id, filename string }
+	type artifactRecord struct{ id, variant, filename, mode string }
 	var artifacts []artifactRecord
 	for rows.Next() {
 		var item artifactRecord
-		if err := rows.Scan(&item.id, &item.filename); err != nil {
+		if err := rows.Scan(&item.id, &item.variant, &item.filename, &item.mode); err != nil {
 			rows.Close()
 			return err
 		}
@@ -736,17 +864,21 @@ func (s *Server) removeTerminalArtifacts() error {
 	}
 	rows.Close()
 	for _, item := range artifacts {
-		if item.filename != item.id+".apk" || filepath.Base(item.filename) != item.filename {
+		filename, err := artifactFilename(item.id, item.variant)
+		if err != nil || item.filename != filename || filepath.Base(item.filename) != item.filename {
 			return fmt.Errorf("nama artifact build %s tidak valid", item.id)
 		}
-		if err := os.Remove(filepath.Join(s.dataDir, "artifacts", item.filename)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Remove(s.artifactPath(item.id, item.mode, item.variant)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		if _, err := s.db.Exec(`UPDATE builds SET artifact=NULL WHERE id=?`, item.id); err != nil {
 			return err
 		}
 	}
-	return removeDirectoryContents(filepath.Join(s.dataDir, "artifacts"))
+	if err := removeDirectoryContents(filepath.Join(s.dataDir, "artifacts")); err != nil {
+		return err
+	}
+	return removeDirectoryContents(filepath.Join(s.dataDir, "public", "artifacts"))
 }
 
 func gradleCacheSize() (int64, error) {
@@ -805,25 +937,30 @@ func (s *Server) handleBuildCollection(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		s.handleBuildCreate(w, r)
 	default:
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Metode HTTP tidak diizinkan.", http.StatusMethodNotAllowed)
 	}
 }
 
 func (s *Server) handleBuildList(w http.ResponseWriter, r *http.Request) {
 	projectID := r.URL.Query().Get("projectId")
 	if !validProjectID(projectID) {
-		http.Error(w, "projectId tidak valid", http.StatusBadRequest)
+		http.Error(w, "ID proyek tidak valid.", http.StatusBadRequest)
 		return
 	}
-	ownerID, err := s.ensureOwner(w, r)
+	ownerID, err := s.requestOwner(w, r)
 	if err != nil {
-		http.Error(w, "gagal membuat identitas browser", http.StatusInternalServerError)
+		http.Error(w, "Gagal membuat identitas peramban.", http.StatusInternalServerError)
+		return
+	}
+	if _, err := s.db.Exec(`UPDATE builds SET updated_at=? WHERE owner_id=? AND access_mode='public'`,
+		time.Now().UTC().Format(time.RFC3339), ownerID); err != nil {
+		http.Error(w, "Gagal memperbarui aktivitas build.", http.StatusInternalServerError)
 		return
 	}
 	rows, err := s.db.Query(`SELECT id,project_id,status,variant,created_at,started_at,finished_at,error,artifact
 		FROM builds WHERE owner_id=? AND project_id=? ORDER BY created_at DESC,id DESC LIMIT 20`, ownerID, projectID)
 	if err != nil {
-		http.Error(w, "gagal membaca riwayat build", http.StatusInternalServerError)
+		http.Error(w, "Gagal membaca riwayat build.", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -832,14 +969,15 @@ func (s *Server) handleBuildList(w http.ResponseWriter, r *http.Request) {
 		var b Build
 		var started, finished, errMsg, artifact sql.NullString
 		if err := rows.Scan(&b.ID, &b.ProjectID, &b.Status, &b.Variant, &b.CreatedAt, &started, &finished, &errMsg, &artifact); err != nil {
-			http.Error(w, "gagal membaca riwayat build", http.StatusInternalServerError)
+			http.Error(w, "Gagal membaca riwayat build.", http.StatusInternalServerError)
 			return
 		}
 		b.StartedAt, b.FinishedAt, b.Error, b.Artifact = started.String, finished.String, errMsg.String, artifact.String
+		b.ProjectType = buildProjectType(b.Variant)
 		builds = append(builds, b)
 	}
 	if err := rows.Err(); err != nil {
-		http.Error(w, "gagal membaca riwayat build", http.StatusInternalServerError)
+		http.Error(w, "Gagal membaca riwayat build.", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -854,7 +992,7 @@ func (s *Server) handleBuildCreate(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &maxBytesErr) {
 			http.Error(w, fmt.Sprintf("ZIP project terlalu besar (maks %d MB)", s.config.Build.MaxUploadMB), http.StatusRequestEntityTooLarge)
 		} else {
-			http.Error(w, "multipart upload gagal", http.StatusBadRequest)
+			http.Error(w, "Unggahan multipart gagal.", http.StatusBadRequest)
 		}
 		return
 	}
@@ -863,55 +1001,63 @@ func (s *Server) handleBuildCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	projectID := r.FormValue("projectId")
 	if !validProjectID(projectID) {
-		http.Error(w, "projectId wajib berupa ID project yang valid", http.StatusBadRequest)
+		http.Error(w, "ID proyek wajib diisi dengan ID yang valid.", http.StatusBadRequest)
 		return
 	}
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
-	ownerID, err := s.ensureOwner(w, r)
+	ownerID, err := s.requestOwner(w, r)
 	if err != nil {
-		http.Error(w, "gagal membuat identitas browser", 500)
+		http.Error(w, "Gagal membuat identitas peramban.", 500)
 		return
 	}
 	if b, err := s.getActiveBuild(ownerID, projectID); err == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
-		json.NewEncoder(w).Encode(map[string]any{"error": "project ini masih punya build aktif", "build": b})
+		json.NewEncoder(w).Encode(map[string]any{"error": "Proyek ini masih memiliki build aktif.", "build": b})
 		return
 	} else if !errors.Is(err, sql.ErrNoRows) {
-		http.Error(w, "gagal memeriksa build aktif", http.StatusInternalServerError)
+		http.Error(w, "Gagal memeriksa build aktif.", http.StatusInternalServerError)
 		return
 	}
 	file, header, err := r.FormFile("project")
 	if err != nil {
-		http.Error(w, "field project wajib berupa ZIP", 400)
+		http.Error(w, "Berkas proyek wajib berformat ZIP.", 400)
 		return
 	}
 	defer file.Close()
 	if !strings.HasSuffix(strings.ToLower(header.Filename), ".zip") {
-		http.Error(w, "file harus berformat ZIP", 400)
+		http.Error(w, "Berkas harus berformat ZIP.", 400)
 		return
 	}
 
-	id := fmt.Sprintf("bld_%d", time.Now().UnixNano())
-	workspace := filepath.Join(s.dataDir, "workspaces", id)
+	id, err := newBuildID()
+	if err != nil {
+		http.Error(w, "Gagal membuat ID build.", http.StatusInternalServerError)
+		return
+	}
+	workspace := s.workspacePath(id, s.config.Mode)
 	if err := os.MkdirAll(workspace, 0750); err != nil {
-		http.Error(w, "gagal membuat workspace", 500)
+		http.Error(w, "Gagal membuat ruang kerja.", 500)
 		return
 	}
 	zipPath := filepath.Join(workspace, "project.zip")
 	dst, err := os.Create(zipPath)
 	if err != nil {
-		http.Error(w, "gagal menyimpan ZIP", 500)
+		http.Error(w, "Gagal menyimpan arsip ZIP.", 500)
 		return
 	}
 	if _, err := io.Copy(dst, file); err != nil {
 		dst.Close()
-		http.Error(w, "gagal menerima ZIP", 500)
+		http.Error(w, "Gagal menerima arsip ZIP.", 500)
 		return
 	}
 	dst.Close()
-	if err := extractZip(zipPath, workspace); err != nil {
+	maxExpandedBytes := uint64(maxProjectBytes)
+	if s.config.Mode == "public" {
+		maxExpandedBytes = uint64(maxPublicProjectBytes)
+	}
+	if err := extractZip(zipPath, workspace, maxExpandedBytes); err != nil {
 		os.RemoveAll(workspace)
 		http.Error(w, "ZIP tidak valid: "+err.Error(), 400)
 		return
@@ -919,26 +1065,31 @@ func (s *Server) handleBuildCreate(w http.ResponseWriter, r *http.Request) {
 	projectRoot, err := findProjectRoot(workspace)
 	if err != nil {
 		os.RemoveAll(workspace)
-		http.Error(w, "struktur project tidak valid: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "Struktur proyek tidak valid: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	if err := validateAndroidProject(projectRoot); err != nil {
 		os.RemoveAll(workspace)
-		http.Error(w, "project tidak valid: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "Proyek tidak valid: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
-	if _, err := s.db.Exec(`INSERT INTO builds (id,project_id,owner_id,status,variant,created_at,updated_at) VALUES (?,?,?,?,?,?,?)`,
-		id, projectID, ownerID, "queued", "debug", now, now); err != nil {
+	blobOwnerID := ownerID
+	if s.config.Mode == "public" {
+		blobOwnerID = "public_build_" + id
+	}
+	if _, err := s.db.Exec(`INSERT INTO builds (id,project_id,owner_id,status,variant,created_at,updated_at,access_mode,blob_owner_id)
+		VALUES (?,?,?,?,?,?,?,?,?)`,
+		id, projectID, ownerID, "queued", "debug", now, now, s.config.Mode, blobOwnerID); err != nil {
 		os.RemoveAll(workspace)
 		if b, activeErr := s.getActiveBuild(ownerID, projectID); activeErr == nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
-			json.NewEncoder(w).Encode(map[string]any{"error": "project ini masih punya build aktif", "build": b})
+			json.NewEncoder(w).Encode(map[string]any{"error": "Proyek ini masih memiliki build aktif.", "build": b})
 			return
 		}
-		http.Error(w, "gagal membuat job build", 500)
+		http.Error(w, "Gagal membuat tugas build.", 500)
 		return
 	}
 	s.addLog(id, "system", "Build job dibuat")
@@ -946,7 +1097,7 @@ func (s *Server) handleBuildCreate(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(Build{ID: id, ProjectID: projectID, Status: "queued", Variant: "debug", CreatedAt: now})
+	json.NewEncoder(w).Encode(Build{ID: id, ProjectID: projectID, ProjectType: "android", Status: "queued", Variant: "debug", CreatedAt: now})
 }
 
 func (s *Server) startBuild(id, workspace string, signing *releaseSigning) {
@@ -972,6 +1123,7 @@ func (s *Server) getActiveBuild(ownerID, projectID string) (Build, error) {
 		return b, err
 	}
 	b.StartedAt, b.FinishedAt, b.Error, b.Artifact = started.String, finished.String, errMsg.String, artifact.String
+	b.ProjectType = buildProjectType(b.Variant)
 	return b, nil
 }
 
@@ -979,13 +1131,13 @@ func (s *Server) handleBuildRoutes(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/api/builds/")
 	parts := strings.Split(strings.Trim(rest, "/"), "/")
 	if len(parts) == 0 || parts[0] == "" {
-		http.Error(w, "build ID required", 400)
+		http.Error(w, "ID build wajib diisi.", 400)
 		return
 	}
 	id := parts[0]
-	ownerID, err := s.ensureOwner(w, r)
+	ownerID, err := s.requestOwner(w, r)
 	if err != nil {
-		http.Error(w, "gagal membuat identitas browser", http.StatusInternalServerError)
+		http.Error(w, "Gagal membuat identitas peramban.", http.StatusInternalServerError)
 		return
 	}
 	action := ""
@@ -996,7 +1148,7 @@ func (s *Server) handleBuildRoutes(w http.ResponseWriter, r *http.Request) {
 	switch action {
 	case "blobs":
 		if len(parts) != 3 {
-			http.Error(w, "hash binary wajib diisi", http.StatusBadRequest)
+			http.Error(w, "Hash berkas biner wajib diisi.", http.StatusBadRequest)
 			return
 		}
 		s.handleBuildBlobUpload(w, r, ownerID, id, parts[2])
@@ -1019,14 +1171,14 @@ func (s *Server) handleBuildRoutes(w http.ResponseWriter, r *http.Request) {
 			if build.Status != "preparing" && build.Status != "assembling" &&
 				build.Status != "queued" && build.Status != "building" {
 				s.maintenanceMu.Unlock()
-				http.Error(w, "build sudah selesai dan tidak bisa dibatalkan", http.StatusConflict)
+				http.Error(w, "Build telah selesai dan tidak dapat dibatalkan.", http.StatusConflict)
 				return
 			}
 			now := time.Now().UTC().Format(time.RFC3339)
 			tx, err := s.db.Begin()
 			if err != nil {
 				s.maintenanceMu.Unlock()
-				http.Error(w, "gagal membatalkan build", http.StatusInternalServerError)
+				http.Error(w, "Gagal membatalkan build.", http.StatusInternalServerError)
 				return
 			}
 			result, err := tx.Exec(`UPDATE builds SET status='canceled',finished_at=?,updated_at=?
@@ -1035,42 +1187,53 @@ func (s *Server) handleBuildRoutes(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				tx.Rollback()
 				s.maintenanceMu.Unlock()
-				http.Error(w, "gagal membatalkan build", http.StatusInternalServerError)
+				http.Error(w, "Gagal membatalkan build.", http.StatusInternalServerError)
 				return
 			}
 			changed, err := result.RowsAffected()
 			if err != nil || changed == 0 {
 				tx.Rollback()
 				s.maintenanceMu.Unlock()
-				http.Error(w, "build sudah selesai dan tidak bisa dibatalkan", http.StatusConflict)
+				http.Error(w, "Build telah selesai dan tidak dapat dibatalkan.", http.StatusConflict)
 				return
 			}
 			if _, err := tx.Exec(`DELETE FROM build_manifests WHERE build_id=?`, id); err != nil {
 				tx.Rollback()
 				s.maintenanceMu.Unlock()
-				http.Error(w, "build dibatalkan, tetapi manifest gagal dihapus", http.StatusInternalServerError)
+				http.Error(w, "Build dibatalkan, tetapi manifest gagal dihapus.", http.StatusInternalServerError)
 				return
 			}
 			if _, err := tx.Exec(`DELETE FROM blob_reservations WHERE build_id=?`, id); err != nil {
 				tx.Rollback()
 				s.maintenanceMu.Unlock()
-				http.Error(w, "build dibatalkan, tetapi reservasi binary gagal dihapus", http.StatusInternalServerError)
+				http.Error(w, "Build dibatalkan, tetapi reservasi berkas biner gagal dihapus.", http.StatusInternalServerError)
 				return
 			}
 			if err := releaseBuildBlobRefsTx(tx, id); err != nil {
 				tx.Rollback()
 				s.maintenanceMu.Unlock()
-				http.Error(w, "build dibatalkan, tetapi referensi binary gagal dilepas", http.StatusInternalServerError)
+				http.Error(w, "Build dibatalkan, tetapi referensi berkas biner gagal dilepas.", http.StatusInternalServerError)
 				return
 			}
 			if err := tx.Commit(); err != nil {
 				s.maintenanceMu.Unlock()
-				http.Error(w, "gagal menyelesaikan pembatalan build", http.StatusInternalServerError)
+				http.Error(w, "Gagal menyelesaikan pembatalan build.", http.StatusInternalServerError)
 				return
 			}
 			s.maintenanceMu.Unlock()
-			if !s.cancelRunningBuild(id) {
-				if err := os.RemoveAll(filepath.Join(s.dataDir, "workspaces", id)); err != nil {
+			mode, _, modeErr := s.buildStorage(id)
+			if modeErr != nil {
+				log.Printf("failed to read canceled build mode %s: %v", id, modeErr)
+				mode = "private"
+			}
+			running := s.cancelRunningBuild(id)
+			if !running {
+				s.buildMu.Lock()
+				running = s.building[id]
+				s.buildMu.Unlock()
+			}
+			if !running {
+				if err := os.RemoveAll(s.workspacePath(id, mode)); err != nil {
 					log.Printf("failed to remove canceled build workspace %s: %v", id, err)
 				}
 				signingDir := filepath.Join(s.dataDir, "signing")
@@ -1079,37 +1242,62 @@ func (s *Server) handleBuildRoutes(w http.ResponseWriter, r *http.Request) {
 					storePasswordPath: filepath.Join(signingDir, id+".storepass"),
 					keyPasswordPath:   filepath.Join(signingDir, id+".keypass"),
 				})
+				if err := s.cleanupPublicBuildCache(id); err != nil {
+					log.Printf("failed to remove canceled public build cache %s: %v", id, err)
+				}
 			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		build, err := s.getBuildForOwner(ownerID, id)
 		if err != nil {
-			http.Error(w, "build tidak ditemukan", 404)
+			http.Error(w, "Build tidak ditemukan.", 404)
+			return
+		}
+		if err := s.touchPublicBuild(id); err != nil {
+			http.Error(w, "Gagal memperbarui aktivitas build.", http.StatusInternalServerError)
 			return
 		}
 		json.NewEncoder(w).Encode(build)
 	case "logs":
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", 405)
+			http.Error(w, "Metode HTTP tidak diizinkan.", 405)
 			return
 		}
 		if _, err := s.getBuildForOwner(ownerID, id); err != nil {
-			http.Error(w, "build tidak ditemukan", http.StatusNotFound)
+			http.Error(w, "Build tidak ditemukan.", http.StatusNotFound)
+			return
+		}
+		if err := s.touchPublicBuild(id); err != nil {
+			http.Error(w, "Gagal memperbarui aktivitas build.", http.StatusInternalServerError)
 			return
 		}
 		s.streamLogs(w, r, id)
 	case "artifact":
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", 405)
+			http.Error(w, "Metode HTTP tidak diizinkan.", 405)
 			return
 		}
 		build, err := s.getBuildForOwner(ownerID, id)
 		if err != nil || build.Artifact == "" {
-			http.Error(w, "artifact belum tersedia", 404)
+			http.Error(w, "Hasil build belum tersedia.", 404)
 			return
 		}
-		http.ServeFile(w, r, filepath.Join(s.dataDir, "artifacts", build.Artifact))
+		expectedFilename, filenameErr := artifactFilename(id, build.Variant)
+		if filenameErr != nil || build.Artifact != expectedFilename || filepath.Base(build.Artifact) != build.Artifact {
+			http.Error(w, "Metadata nama hasil build tidak valid.", http.StatusInternalServerError)
+			return
+		}
+		mode, _, modeErr := s.buildStorage(id)
+		if modeErr != nil {
+			http.Error(w, "Gagal membaca mode build.", http.StatusInternalServerError)
+			return
+		}
+		if err := s.touchPublicBuild(id); err != nil {
+			http.Error(w, "Gagal memperbarui aktivitas hasil build.", http.StatusInternalServerError)
+			return
+		}
+		http.ServeFile(w, r, s.artifactPath(id, mode, build.Variant))
 	default:
 		http.NotFound(w, r)
 	}
@@ -1124,6 +1312,7 @@ func (s *Server) getBuild(id string) (Build, error) {
 		return b, err
 	}
 	b.StartedAt, b.FinishedAt, b.Error, b.Artifact = started.String, finished.String, errMsg.String, artifact.String
+	b.ProjectType = buildProjectType(b.Variant)
 	return b, nil
 }
 
@@ -1137,13 +1326,16 @@ func (s *Server) getBuildForOwner(ownerID, id string) (Build, error) {
 		return b, err
 	}
 	b.StartedAt, b.FinishedAt, b.Error, b.Artifact = started.String, finished.String, errMsg.String, artifact.String
+	b.ProjectType = buildProjectType(b.Variant)
 	return b, nil
 }
 
 func (s *Server) addLog(id, stream, message string) {
+	now := time.Now().UTC().Format(time.RFC3339)
 	s.db.Exec(`INSERT INTO build_logs(build_id,sequence,stream,message,created_at)
 		SELECT ?,COALESCE(MAX(sequence),0)+1,?,?,? FROM build_logs WHERE build_id=?`,
-		id, stream, strings.TrimSuffix(message, "\n"), time.Now().UTC().Format(time.RFC3339), id)
+		id, stream, strings.TrimSuffix(message, "\n"), now, id)
+	s.db.Exec(`UPDATE builds SET updated_at=? WHERE id=? AND access_mode='public'`, now, id)
 }
 
 func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request, id string) {
@@ -1152,7 +1344,7 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request, id string) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "SSE unsupported", 500)
+		http.Error(w, "Server tidak mendukung Server-Sent Events.", 500)
 		return
 	}
 	last := 0
@@ -1186,7 +1378,7 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request, id string) {
 	}
 }
 
-func extractZip(src, dest string) error {
+func extractZip(src, dest string, limits ...uint64) error {
 	r, err := zip.OpenReader(src)
 	if err != nil {
 		return err
@@ -1194,6 +1386,10 @@ func extractZip(src, dest string) error {
 	defer r.Close()
 	destAbs, _ := filepath.Abs(dest)
 	var totalUncompressed uint64
+	totalLimit := uint64(maxProjectBytes)
+	if len(limits) > 0 {
+		totalLimit = limits[0]
+	}
 	if len(r.File) > 20000 {
 		return errors.New("jumlah entry ZIP melebihi batas 20.000")
 	}
@@ -1205,11 +1401,20 @@ func extractZip(src, dest string) error {
 		if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 			return errors.New("path traversal terdeteksi")
 		}
-		if f.UncompressedSize64 > 50<<20 {
+		fileLimit := uint64(50 << 20)
+		if totalLimit < fileLimit {
+			fileLimit = totalLimit
+		}
+		if f.UncompressedSize64 > fileLimit {
+			if totalLimit == uint64(maxPublicProjectBytes) {
+				return errors.New("ukuran satu file ZIP mode publik melebihi 10 MiB")
+			}
 			return errors.New("ukuran satu file ZIP melebihi 50 MB")
 		}
-		totalUncompressed += f.UncompressedSize64
-		if totalUncompressed > 250<<20 {
+		if f.UncompressedSize64 > totalLimit-totalUncompressed {
+			if totalLimit == uint64(maxPublicProjectBytes) {
+				return errors.New("ukuran project mode publik melebihi 10 MiB setelah diekstrak")
+			}
 			return errors.New("total ukuran project setelah diekstrak melebihi 250 MB")
 		}
 		target := filepath.Join(destAbs, clean)
@@ -1230,16 +1435,31 @@ func extractZip(src, dest string) error {
 			return err
 		}
 		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0640)
-		if err == nil {
-			_, err = io.Copy(out, rc)
-		}
-		rc.Close()
-		if out != nil {
-			out.Close()
-		}
 		if err != nil {
+			rc.Close()
 			return err
 		}
+		remaining := totalLimit - totalUncompressed
+		maxFileBytes := fileLimit
+		if remaining < maxFileBytes {
+			maxFileBytes = remaining
+		}
+		written, copyErr := io.Copy(out, io.LimitReader(rc, int64(maxFileBytes)+1))
+		outErr := out.Close()
+		rc.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if uint64(written) > maxFileBytes {
+			if totalLimit == uint64(maxPublicProjectBytes) {
+				return errors.New("ukuran project mode publik melebihi 10 MiB setelah diekstrak")
+			}
+			return errors.New("total ukuran project setelah diekstrak melebihi 250 MB")
+		}
+		if outErr != nil {
+			return outErr
+		}
+		totalUncompressed += uint64(written)
 	}
 	return nil
 }
@@ -1255,6 +1475,44 @@ func validateAndroidProject(root string) error {
 		return errors.New("app/src/main/AndroidManifest.xml tidak ditemukan")
 	}
 	return nil
+}
+
+func validateJavaLibraryProject(root string) error {
+	if !fileExists(filepath.Join(root, "settings.gradle")) && !fileExists(filepath.Join(root, "settings.gradle.kts")) {
+		return errors.New("settings.gradle atau settings.gradle.kts tidak ditemukan")
+	}
+	if !fileExists(filepath.Join(root, "build.gradle")) && !fileExists(filepath.Join(root, "build.gradle.kts")) {
+		return errors.New("build.gradle atau build.gradle.kts tidak ditemukan di root project")
+	}
+	foundJavaSource := false
+	err := filepath.Walk(filepath.Join(root, "src", "main", "java"), func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info != nil && !info.IsDir() && strings.EqualFold(filepath.Ext(path), ".java") {
+			foundJavaSource = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("gagal memeriksa source java: %w", err)
+	}
+	if !foundJavaSource {
+		return errors.New("source java tidak ditemukan di src/main/java")
+	}
+	return nil
+}
+
+func validateProjectForBuild(root, projectType string) error {
+	switch projectType {
+	case "android":
+		return validateAndroidProject(root)
+	case "java-library":
+		return validateJavaLibraryProject(root)
+	default:
+		return errors.New("Jenis proyek tidak didukung.")
+	}
 }
 
 func fileExists(path string) bool {
@@ -1283,6 +1541,11 @@ func (s *Server) runBuildWithSigning(id, workspace string, signing *releaseSigni
 	s.building[id] = true
 	s.buildMu.Unlock()
 	defer func() { s.buildMu.Lock(); delete(s.building, id); s.buildMu.Unlock() }()
+	defer func() {
+		if err := s.cleanupPublicBuildCache(id); err != nil {
+			log.Printf("failed to remove public build cache %s: %v", id, err)
+		}
+	}()
 
 	projectRoot := workspace
 	if root, err := findProjectRoot(workspace); err == nil {
@@ -1297,15 +1560,16 @@ func (s *Server) runBuildWithSigning(id, workspace string, signing *releaseSigni
 		return
 	}
 	hostProjectRoot := filepath.Join(s.hostDataDir, relativeRoot)
-	var variant string
-	if err := s.db.QueryRow(`SELECT variant FROM builds WHERE id=?`, id).Scan(&variant); err != nil {
+	var variant, accessMode string
+	if err := s.db.QueryRow(`SELECT variant,access_mode FROM builds WHERE id=?`, id).Scan(&variant, &accessMode); err != nil {
 		s.failBuild(id, "gagal membaca variant build")
 		return
 	}
-	if variant != "debug" && variant != "release" {
+	if _, err := artifactExtension(variant); err != nil {
 		s.failBuild(id, "variant build tidak valid")
 		return
 	}
+	projectType := buildProjectType(variant)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.config.Build.TimeoutMinutes)*time.Minute)
 	defer cancel()
 	s.buildMu.Lock()
@@ -1345,13 +1609,35 @@ func (s *Server) runBuildWithSigning(id, workspace string, signing *releaseSigni
 	}
 	s.addLog(id, "system", "Menjalankan Docker build container")
 	outputsDir := filepath.Join(projectRoot, "app", "build", "outputs", "apk")
+	gradleTask := "assembleDebug"
+	if projectType == "java-library" {
+		outputsDir = filepath.Join(projectRoot, "build", "libs")
+		gradleTask = "jar"
+		if variant == "fat-jar" {
+			gradleTask = "fatJar"
+		}
+	} else if variant == "release" {
+		gradleTask = "assembleRelease"
+	}
 	if err := os.RemoveAll(outputsDir); err != nil {
-		s.failBuild(id, "gagal membersihkan output APK sebelumnya")
+		s.failBuild(id, "gagal membersihkan output build sebelumnya")
 		return
 	}
-	gradleTask := "assembleDebug"
-	if variant == "release" {
-		gradleTask = "assembleRelease"
+	gradleCacheMount := "androidide_gradle:/root/.gradle"
+	if accessMode == "public" {
+		gradleCacheDir := filepath.Join(s.dataDir, "public", "gradle", id)
+		if err := os.MkdirAll(gradleCacheDir, 0700); err != nil {
+			s.failBuild(id, "gagal membuat cache Gradle sementara")
+			return
+		}
+		relativeGradleDir, err := filepath.Rel(s.dataDir, gradleCacheDir)
+		if err != nil || relativeGradleDir == ".." ||
+			strings.HasPrefix(relativeGradleDir, ".."+string(filepath.Separator)) {
+			s.failBuild(id, "cache Gradle sementara berada di luar DATA_DIR")
+			return
+		}
+		hostGradleDir := filepath.Join(s.hostDataDir, relativeGradleDir)
+		gradleCacheMount = hostGradleDir + ":/root/.gradle"
 	}
 	containerName := "android-ide-build-" + id
 	cmd := exec.CommandContext(ctx, "docker", "run", "--rm",
@@ -1359,7 +1645,7 @@ func (s *Server) runBuildWithSigning(id, workspace string, signing *releaseSigni
 		fmt.Sprintf("--memory=%dm", s.config.Build.MemoryMB),
 		fmt.Sprintf("--cpus=%d", s.config.Build.CPUs), "--pids-limit=256",
 		"-v", hostProjectRoot+":/project",
-		"-v", "androidide_gradle:/root/.gradle",
+		"-v", gradleCacheMount,
 		androidBuilderImage(),
 		"/bin/bash", "-lc", "if [ -x ./gradlew ]; then ./gradlew --no-daemon "+gradleTask+"; elif [ -f ./gradlew ]; then chmod +x ./gradlew && ./gradlew --no-daemon "+gradleTask+"; else gradle --no-daemon "+gradleTask+"; fi")
 	cmd.Cancel = func() error {
@@ -1380,6 +1666,18 @@ func (s *Server) runBuildWithSigning(id, workspace string, signing *releaseSigni
 		s.failBuild(id, "gagal menjalankan Docker: "+err.Error())
 		return
 	}
+	monitorDone := make(chan struct{})
+	stopMonitor := func() {}
+	if s.config.Mode == "private" {
+		monitorCtx, cancelMonitor := context.WithCancel(ctx)
+		stopMonitor = cancelMonitor
+		go func() {
+			defer close(monitorDone)
+			s.monitorBuildContainer(monitorCtx, id, containerName)
+		}()
+	} else {
+		close(monitorDone)
+	}
 	var logWriters sync.WaitGroup
 	logWriters.Add(2)
 	go func() {
@@ -1391,6 +1689,8 @@ func (s *Server) runBuildWithSigning(id, workspace string, signing *releaseSigni
 		s.copyLogs(id, "stderr", stderr)
 	}()
 	err = cmd.Wait()
+	stopMonitor()
+	<-monitorDone
 	logWriters.Wait()
 	if ctx.Err() == context.Canceled {
 		s.addLog(id, "system", "Build dibatalkan")
@@ -1405,13 +1705,18 @@ func (s *Server) runBuildWithSigning(id, workspace string, signing *releaseSigni
 		return
 	}
 
-	apk, err := findAPKVariant(projectRoot, variant)
+	var outputFile string
+	if projectType == "java-library" {
+		outputFile, err = findJavaLibraryJar(projectRoot, variant == "fat-jar")
+	} else {
+		outputFile, err = findAPKVariant(projectRoot, variant)
+	}
 	if err != nil {
 		s.failBuild(id, err.Error())
 		return
 	}
 	if signing != nil {
-		apk, err = s.signReleaseAPK(ctx, id, hostProjectRoot, projectRoot, apk, signing)
+		outputFile, err = s.signReleaseAPK(ctx, id, hostProjectRoot, projectRoot, outputFile, signing)
 		if ctx.Err() == context.Canceled {
 			s.addLog(id, "system", "Build dibatalkan")
 			return
@@ -1426,21 +1731,25 @@ func (s *Server) runBuildWithSigning(id, workspace string, signing *releaseSigni
 		}
 		s.cleanupReleaseSigning(signing)
 	}
-	filename := id + ".apk"
-	artifact := filepath.Join(s.dataDir, "artifacts", filename)
+	filename, err := artifactFilename(id, variant)
+	if err != nil {
+		s.failBuild(id, "jenis artifact build tidak valid")
+		return
+	}
+	artifact := s.artifactPath(id, accessMode, variant)
 	if err := os.MkdirAll(filepath.Dir(artifact), 0750); err != nil {
 		s.failBuild(id, "gagal membuat direktori artifact")
 		return
 	}
-	input, err := os.Open(apk)
+	input, err := os.Open(outputFile)
 	if err != nil {
-		s.failBuild(id, "gagal membaca APK hasil build")
+		s.failBuild(id, "gagal membaca file hasil build")
 		return
 	}
 	output, err := os.Create(artifact)
 	if err != nil {
 		input.Close()
-		s.failBuild(id, "gagal menyimpan APK")
+		s.failBuild(id, "gagal menyimpan artifact")
 		return
 	}
 	_, copyErr := io.Copy(output, input)
@@ -1448,7 +1757,7 @@ func (s *Server) runBuildWithSigning(id, workspace string, signing *releaseSigni
 	outputErr := output.Close()
 	if copyErr != nil || inputErr != nil || outputErr != nil {
 		os.Remove(artifact)
-		s.failBuild(id, "gagal menyalin APK hasil build")
+		s.failBuild(id, "gagal menyalin artifact hasil build")
 		return
 	}
 	if ctx.Err() == context.Canceled {
@@ -1456,10 +1765,11 @@ func (s *Server) runBuildWithSigning(id, workspace string, signing *releaseSigni
 		s.addLog(id, "system", "Build dibatalkan")
 		return
 	}
-	s.addLog(id, "system", "APK berhasil dibuild")
-	result, err = s.db.Exec(`UPDATE builds SET status='success',finished_at=?,artifact=?
+	s.addLog(id, "system", "Artifact berhasil dibuild: "+filename)
+	finishedAt := time.Now().UTC().Format(time.RFC3339)
+	result, err = s.db.Exec(`UPDATE builds SET status='success',finished_at=?,updated_at=?,artifact=?
 		WHERE id=? AND status='building'`,
-		time.Now().UTC().Format(time.RFC3339), filename, id)
+		finishedAt, finishedAt, filename, id)
 	if err != nil {
 		log.Printf("failed to save success status for build %s: %v", id, err)
 		os.Remove(artifact)
@@ -1542,6 +1852,9 @@ func (s *Server) failBuild(id, message string) {
 	s.enqueueBuildNotification(id, "failed")
 	s.db.Exec(`DELETE FROM build_manifests WHERE build_id=?`, id)
 	s.db.Exec(`DELETE FROM blob_reservations WHERE build_id=?`, id)
+	if err := s.cleanupPublicBuildCache(id); err != nil {
+		log.Printf("failed to remove failed public build cache %s: %v", id, err)
+	}
 }
 
 func findProjectRoot(workspace string) (string, error) {
@@ -1562,7 +1875,7 @@ func findProjectRoot(workspace string) (string, error) {
 		return nil
 	})
 	if found == "" {
-		return "", fmt.Errorf("project tidak memiliki settings.gradle atau settings.gradle.kts")
+		return "", fmt.Errorf("Proyek tidak memiliki settings.gradle atau settings.gradle.kts.")
 	}
 	return found, nil
 }
@@ -1653,4 +1966,34 @@ func findAPKVariant(root, variant string) (string, error) {
 		return "", fmt.Errorf("APK %s tidak ditemukan setelah Gradle build", variant)
 	}
 	return apk, nil
+}
+
+func findJavaLibraryJar(root string, fat bool) (string, error) {
+	matches, err := filepath.Glob(filepath.Join(root, "build", "libs", "*.jar"))
+	if err != nil {
+		return "", err
+	}
+	filtered := matches[:0]
+	for _, path := range matches {
+		isFat := strings.HasSuffix(filepath.Base(path), "-all.jar")
+		if isFat == fat {
+			info, err := os.Stat(path)
+			if err != nil {
+				return "", err
+			}
+			if info.Mode().IsRegular() {
+				filtered = append(filtered, path)
+			}
+		}
+	}
+	if len(filtered) == 0 {
+		if fat {
+			return "", errors.New("fat jar tidak ditemukan setelah Gradle build")
+		}
+		return "", errors.New("jar standar tidak ditemukan setelah Gradle build")
+	}
+	if len(filtered) > 1 {
+		return "", errors.New("lebih dari satu jar hasil build ditemukan")
+	}
+	return filtered[0], nil
 }

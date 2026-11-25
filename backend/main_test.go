@@ -223,6 +223,69 @@ func TestNormalizeManifestDefaultsAndValidatesBuildVariant(t *testing.T) {
 	if _, _, err := normalizeManifest(manifest); err == nil {
 		t.Fatal("expected unsupported build variant to be rejected")
 	}
+	manifest.ProjectType = "java-library"
+	manifest.Variant = ""
+	normalized, _, err = normalizeManifest(manifest)
+	if err != nil || normalized.Variant != "jar" {
+		t.Fatalf("java library default variant = %q, err=%v; want jar", normalized.Variant, err)
+	}
+	manifest.Variant = "fat-jar"
+	normalized, _, err = normalizeManifest(manifest)
+	if err != nil || normalized.Variant != "fat-jar" {
+		t.Fatalf("fat jar variant = %q, err=%v", normalized.Variant, err)
+	}
+	manifest.Variant = "release"
+	if _, _, err := normalizeManifest(manifest); err == nil {
+		t.Fatal("expected Android variant to be rejected for java library")
+	}
+}
+
+func TestValidateJavaLibraryProject(t *testing.T) {
+	root := t.TempDir()
+	if err := validateJavaLibraryProject(root); err == nil || !strings.Contains(err.Error(), "settings.gradle") {
+		t.Fatalf("expected missing settings.gradle error, got %v", err)
+	}
+	for path, content := range map[string]string{
+		"settings.gradle.kts":                `rootProject.name = "sample"`,
+		"build.gradle.kts":                   "plugins { `java-library` }",
+		"src/main/java/example/Library.java": "package example; public class Library {}",
+	} {
+		full := filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := validateJavaLibraryProject(root); err != nil {
+		t.Fatalf("expected valid Java library project, got %v", err)
+	}
+}
+
+func TestFindJavaLibraryJarSelectsPackaging(t *testing.T) {
+	root := t.TempDir()
+	libs := filepath.Join(root, "build", "libs")
+	if err := os.MkdirAll(libs, 0750); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"library.jar", "library-all.jar"} {
+		if err := os.WriteFile(filepath.Join(libs, name), []byte("jar"), 0640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, test := range []struct {
+		fat  bool
+		want string
+	}{
+		{false, "library.jar"},
+		{true, "library-all.jar"},
+	} {
+		got, err := findJavaLibraryJar(root, test.fat)
+		if err != nil || filepath.Base(got) != test.want {
+			t.Errorf("findJavaLibraryJar(%t) = %q, %v; want %q", test.fat, got, err, test.want)
+		}
+	}
 }
 
 func TestBuildPreparePersistsReleaseVariant(t *testing.T) {

@@ -27,7 +27,7 @@ type notificationSettings struct {
 
 func (s *Server) handleNotificationSettings(w http.ResponseWriter, r *http.Request) {
 	if s.config.Mode != "private" {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "email notification settings require private mode"})
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "Pengaturan notifikasi email hanya tersedia dalam mode privat."})
 		return
 	}
 
@@ -35,7 +35,7 @@ func (s *Server) handleNotificationSettings(w http.ResponseWriter, r *http.Reque
 	case http.MethodGet:
 		settings, err := s.readNotificationSettings()
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "gagal membaca pengaturan notifikasi"})
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Gagal membaca pengaturan notifikasi."})
 			return
 		}
 		settings.SMTPConfigured = s.smtpConfigured()
@@ -44,18 +44,18 @@ func (s *Server) handleNotificationSettings(w http.ResponseWriter, r *http.Reque
 		r.Body = http.MaxBytesReader(w, r.Body, 4096)
 		var settings notificationSettings
 		if err := json.NewDecoder(r.Body).Decode(&settings); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "pengaturan notifikasi tidak valid"})
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Pengaturan notifikasi tidak valid."})
 			return
 		}
 		recipient := strings.TrimSpace(settings.Recipient)
 		if len(recipient) > 320 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "email penerima terlalu panjang"})
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Alamat email penerima terlalu panjang."})
 			return
 		}
 		if recipient != "" {
 			address, err := mail.ParseAddress(recipient)
 			if err != nil || address.Address == "" {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "format email penerima tidak valid"})
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Format alamat email penerima tidak valid."})
 				return
 			}
 			recipient = address.Address
@@ -64,18 +64,18 @@ func (s *Server) handleNotificationSettings(w http.ResponseWriter, r *http.Reque
 			SET recipient=?,notify_success=?,notify_failure=?,updated_at=? WHERE id=1`,
 			recipient, settings.NotifySuccess, settings.NotifyFailure, time.Now().UTC().Format(time.RFC3339))
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "gagal menyimpan pengaturan notifikasi"})
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Gagal menyimpan pengaturan notifikasi."})
 			return
 		}
 		saved, err := s.readNotificationSettings()
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "pengaturan tersimpan, tetapi gagal membacanya kembali"})
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Pengaturan tersimpan, tetapi gagal dibaca kembali."})
 			return
 		}
 		saved.SMTPConfigured = s.smtpConfigured()
 		writeJSON(w, http.StatusOK, saved)
 	default:
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Metode HTTP tidak diizinkan."})
 	}
 }
 
@@ -103,6 +103,14 @@ func (s *Server) smtpConfigured() bool {
 
 func (s *Server) enqueueBuildNotification(buildID, status string) {
 	if status != "success" && status != "failed" {
+		return
+	}
+	var accessMode string
+	if err := s.db.QueryRow(`SELECT access_mode FROM builds WHERE id=?`, buildID).Scan(&accessMode); err != nil {
+		log.Printf("failed to read build mode for notification %s: %v", buildID, err)
+		return
+	}
+	if accessMode == "public" {
 		return
 	}
 	settings, err := s.readNotificationSettings()

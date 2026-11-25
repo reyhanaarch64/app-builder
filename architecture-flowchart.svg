@@ -1,0 +1,191 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="1520" viewBox="0 0 720 1520" role="img" aria-labelledby="title description">
+  <title id="title">Arsitektur dan workflow App Builder</title>
+  <desc id="description">Diagram vertikal alur project dari browser, IndexedDB dan import sampai backend Go, Docker Gradle worker, APK atau JAR, artifact, dan aturan storage public serta private.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#111c2f"/>
+    </linearGradient>
+    <linearGradient id="header" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#123f57"/>
+      <stop offset="1" stop-color="#1b345c"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#8ca7c4"/>
+    </marker>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#55b5eb"/>
+    </marker>
+    <style>
+      text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #e6edf7; }
+      .title { font-size: 25px; font-weight: 750; letter-spacing: .2px; }
+      .subtitle { font-size: 11px; fill: #a9bad0; }
+      .section { font-size: 10px; font-weight: 750; letter-spacing: 1.5px; fill: #86a3c2; }
+      .node-title { font-size: 13px; font-weight: 700; }
+      .node-text { font-size: 10px; fill: #bac9dc; }
+      .tiny { font-size: 9px; fill: #a8bbd2; }
+      .tag { font-size: 8px; font-weight: 750; letter-spacing: .7px; }
+      .panel { fill: #101b2c; stroke: #25364e; stroke-width: 1; }
+      .browser { fill: #102237; stroke: #3974a2; stroke-width: 1.2; }
+      .api { fill: #17233a; stroke: #7892ca; stroke-width: 1.2; }
+      .storage { fill: #102b2a; stroke: #40a89a; stroke-width: 1.2; }
+      .worker { fill: #2a2037; stroke: #a77ad0; stroke-width: 1.2; }
+      .output { fill: #302719; stroke: #d29d46; stroke-width: 1.2; }
+      .line { fill: none; stroke: #8ca7c4; stroke-width: 1.6; marker-end: url(#arrow); }
+      .line-blue { fill: none; stroke: #55b5eb; stroke-width: 1.6; marker-end: url(#arrow-blue); }
+      .divider { stroke: #28384e; stroke-width: 1; }
+    </style>
+  </defs>
+
+  <rect width="720" height="1520" fill="url(#background)"/>
+  <rect x="22" y="20" width="676" height="82" rx="18" fill="url(#header)" stroke="#32688a"/>
+  <text x="42" y="54" class="title">App Builder · arsitektur &amp; workflow</text>
+  <text x="43" y="77" class="subtitle">Browser IDE → API Go → isolated Gradle worker → APK / JAR</text>
+  <rect x="575" y="36" width="98" height="24" rx="12" fill="#0b2538" stroke="#4387a8"/>
+  <text x="624" y="52" text-anchor="middle" class="tag" fill="#7dd3fc">720 × 1520</text>
+
+  <text x="34" y="128" class="section">1 · CLIENT &amp; PROJECT INGESTION</text>
+  <rect x="22" y="140" width="676" height="216" rx="16" class="panel"/>
+  <rect x="42" y="158" width="278" height="68" rx="12" class="browser"/>
+  <text x="58" y="181" class="node-title">React + TypeScript web IDE</text>
+  <text x="58" y="199" class="node-text">Monaco editor · project dashboard · build UI</text>
+  <text x="58" y="214" class="tiny">Debug / release · JAR / fat JAR · build status</text>
+
+  <rect x="400" y="158" width="278" height="68" rx="12" class="browser"/>
+  <text x="416" y="181" class="node-title">Project sources</text>
+  <text x="416" y="199" class="node-text">Template baru · import ZIP dari perangkat</text>
+  <text x="416" y="214" class="tiny">Import GitHub: server fetch ZIP → browser</text>
+
+  <path d="M400 192 H328" class="line-blue"/>
+  <text x="364" y="181" text-anchor="middle" class="tiny">input</text>
+
+  <rect x="42" y="246" width="278" height="82" rx="12" class="storage"/>
+  <text x="58" y="270" class="node-title">IndexedDB · storage lokal browser</text>
+  <text x="58" y="289" class="node-text">Project tree, file teks, binary asset</text>
+  <text x="58" y="307" class="tiny">Project tetap di perangkat; bukan workspace server</text>
+
+  <rect x="400" y="246" width="278" height="82" rx="12" class="browser"/>
+  <text x="416" y="270" class="node-title">Edit &amp; pilih opsi build</text>
+  <text x="416" y="289" class="node-text">Android: Kotlin / Java · Java library: Java 17</text>
+  <text x="416" y="307" class="tiny">Validasi file · hashing SHA-256 · manifest</text>
+
+  <path d="M181 226 V238" class="line-blue"/>
+  <path d="M539 226 V238" class="line-blue"/>
+  <path d="M320 287 H392" class="line-blue"/>
+  <path d="M539 328 V378 H590 V439 H568" class="line-blue"/>
+  <text x="598" y="403" class="tiny">build dimulai</text>
+
+  <text x="34" y="396" class="section">2 · BUILD API &amp; MANIFEST</text>
+  <rect x="160" y="408" width="400" height="62" rx="12" class="api"/>
+  <text x="360" y="432" text-anchor="middle" class="node-title">HTTP API · Go server</text>
+  <text x="360" y="451" text-anchor="middle" class="node-text">Auth middleware · owner/session · route /api/builds/*</text>
+
+  <path d="M360 470 V486" class="line"/>
+  <rect x="160" y="490" width="400" height="78" rx="12" class="api"/>
+  <text x="360" y="514" text-anchor="middle" class="node-title">POST /api/builds/prepare</text>
+  <text x="360" y="533" text-anchor="middle" class="node-text">Normalisasi projectType + variant · idempotency key</text>
+  <text x="360" y="550" text-anchor="middle" class="tiny">Validasi manifest/path/hash · batas ukuran project</text>
+
+  <rect x="25" y="494" width="118" height="70" rx="10" class="panel"/>
+  <text x="84" y="515" text-anchor="middle" class="tag" fill="#8fb5df">MODE PUBLIK</text>
+  <text x="84" y="534" text-anchor="middle" class="tiny">maks 10 MiB</text>
+  <text x="84" y="549" text-anchor="middle" class="tiny">per build</text>
+  <path d="M143 529 H152" class="line"/>
+
+  <rect x="577" y="494" width="118" height="70" rx="10" class="panel"/>
+  <text x="636" y="515" text-anchor="middle" class="tag" fill="#8fb5df">MODE PRIVATE</text>
+  <text x="636" y="534" text-anchor="middle" class="tiny">maks 250 MB</text>
+  <text x="636" y="549" text-anchor="middle" class="tiny">per build</text>
+  <path d="M560 529 H569" class="line"/>
+
+  <path d="M360 568 V584" class="line"/>
+  <rect x="160" y="588" width="400" height="80" rx="12" class="storage"/>
+  <text x="360" y="612" text-anchor="middle" class="node-title">Binary cache &amp; upload terverifikasi</text>
+  <text x="360" y="631" text-anchor="middle" class="node-text">Cache SHA-256 yang ada dipakai ulang</text>
+  <text x="360" y="649" text-anchor="middle" class="tiny">Browser PUT hanya hash yang missing → server verifikasi size + SHA-256</text>
+
+  <rect x="25" y="594" width="118" height="68" rx="10" class="storage"/>
+  <text x="84" y="615" text-anchor="middle" class="tag" fill="#79d6c6">SQLITE</text>
+  <text x="84" y="634" text-anchor="middle" class="tiny">build state</text>
+  <text x="84" y="649" text-anchor="middle" class="tiny">manifest + logs</text>
+  <path d="M143 627 H152" class="line"/>
+
+  <rect x="577" y="594" width="118" height="68" rx="10" class="storage"/>
+  <text x="636" y="615" text-anchor="middle" class="tag" fill="#79d6c6">BLOB STORE</text>
+  <text x="636" y="634" text-anchor="middle" class="tiny">SHA-256 keyed</text>
+  <text x="636" y="649" text-anchor="middle" class="tiny">binary assets</text>
+  <path d="M560 627 H569" class="line"/>
+
+  <path d="M360 668 V684" class="line"/>
+  <rect x="160" y="688" width="400" height="78" rx="12" class="api"/>
+  <text x="360" y="712" text-anchor="middle" class="node-title">POST /api/builds/{id}/finalize</text>
+  <text x="360" y="731" text-anchor="middle" class="node-text">Rakit workspace dari manifest + binary cache</text>
+  <text x="360" y="749" text-anchor="middle" class="tiny">Validasi struktur Android atau Java library sebelum worker</text>
+
+  <path d="M360 766 V782" class="line"/>
+  <rect x="160" y="786" width="400" height="64" rx="12" class="api"/>
+  <text x="360" y="810" text-anchor="middle" class="node-title">Queue &amp; build lifecycle</text>
+  <text x="360" y="829" text-anchor="middle" class="node-text">preparing → assembling → queued → building → terminal</text>
+  <text x="360" y="844" text-anchor="middle" class="tiny">Cancel · riwayat · active builds per project</text>
+
+  <text x="34" y="882" class="section">3 · ISOLATED BUILD WORKER &amp; OUTPUT</text>
+  <path d="M360 850 V872" class="line"/>
+  <rect x="130" y="890" width="460" height="100" rx="14" class="worker"/>
+  <text x="360" y="914" text-anchor="middle" class="node-title">Docker build container · Gradle 8.9 · JDK 17</text>
+  <text x="360" y="934" text-anchor="middle" class="node-text">Workspace mounted ke /project · timeout + memory/CPU limit</text>
+  <rect x="160" y="950" width="178" height="24" rx="8" fill="#392846" stroke="#a77ad0"/>
+  <text x="249" y="966" text-anchor="middle" class="tag">ANDROID · assemble* APK</text>
+  <rect x="382" y="950" width="178" height="24" rx="8" fill="#392846" stroke="#a77ad0"/>
+  <text x="471" y="966" text-anchor="middle" class="tag">JAVA · jar / fatJar</text>
+
+  <rect x="25" y="905" width="88" height="70" rx="10" class="panel"/>
+  <text x="69" y="929" text-anchor="middle" class="tag" fill="#caa8e8">DOCKER</text>
+  <text x="69" y="947" text-anchor="middle" class="tiny">builder image</text>
+  <text x="69" y="962" text-anchor="middle" class="tiny">Android SDK</text>
+  <path d="M113 940 H122" class="line"/>
+
+  <rect x="607" y="905" width="88" height="70" rx="10" class="panel"/>
+  <text x="651" y="929" text-anchor="middle" class="tag" fill="#caa8e8">CACHE</text>
+  <text x="651" y="947" text-anchor="middle" class="tiny">Gradle deps</text>
+  <text x="651" y="962" text-anchor="middle" class="tiny">per mode</text>
+  <path d="M590 940 H599" class="line"/>
+
+  <path d="M360 990 V1006" class="line"/>
+  <rect x="160" y="1010" width="400" height="72" rx="12" class="output"/>
+  <text x="360" y="1034" text-anchor="middle" class="node-title">Artifact store + metadata</text>
+  <text x="360" y="1053" text-anchor="middle" class="node-text">APK (.apk) atau Java library (.jar) disimpan terpisah</text>
+  <text x="360" y="1070" text-anchor="middle" class="tiny">SQLite mencatat status, variant, artifact, timestamp, error</text>
+
+  <path d="M360 1082 V1098" class="line"/>
+  <rect x="160" y="1102" width="400" height="70" rx="12" class="api"/>
+  <text x="360" y="1126" text-anchor="middle" class="node-title">Status, logs &amp; notifikasi</text>
+  <text x="360" y="1145" text-anchor="middle" class="node-text">Frontend refreshes status · SSE stream log · active build dashboard</text>
+  <text x="360" y="1161" text-anchor="middle" class="tiny">Email success/failure di mode private (SMTP opsional)</text>
+
+  <path d="M360 1172 V1188" class="line-blue"/>
+  <rect x="160" y="1192" width="400" height="60" rx="12" class="output"/>
+  <text x="360" y="1216" text-anchor="middle" class="node-title">Download artifact dari browser</text>
+  <text x="360" y="1236" text-anchor="middle" class="node-text">GET /api/builds/{id}/artifact · list/delete via /api/artifacts</text>
+
+  <text x="34" y="1280" class="section">4 · DEPLOYMENT, STORAGE &amp; LIFECYCLE</text>
+  <rect x="22" y="1292" width="676" height="206" rx="16" class="panel"/>
+  <rect x="40" y="1310" width="310" height="82" rx="12" class="storage"/>
+  <text x="58" y="1334" class="node-title">Public · ephemeral &amp; terisolasi</text>
+  <text x="58" y="1353" class="node-text">Workspace, blobs, cache Gradle, artifact per build</text>
+  <text x="58" y="1371" class="tiny">Cache selesai dibersihkan; data idle dibersihkan setelah 5 menit</text>
+
+  <rect x="370" y="1310" width="310" height="82" rx="12" class="storage"/>
+  <text x="388" y="1334" class="node-title">Private · persisten per owner</text>
+  <text x="388" y="1353" class="node-text">Project lokal IndexedDB; artifact/cache di storage server</text>
+  <text x="388" y="1371" class="tiny">Dihapus manual lewat UI cleanup; login + session</text>
+
+  <rect x="40" y="1410" width="640" height="66" rx="12" class="api"/>
+  <text x="58" y="1434" class="node-title">Docker Compose · service container</text>
+  <text x="58" y="1453" class="node-text">Go API + static frontend · /data volume · Docker socket untuk worker build</text>
+  <text x="58" y="1469" class="tiny">Build image diproduksi build.sh; service restart memakai image dan frontend terbaru</text>
+  <path d="M195 1392 V1402" class="line"/>
+  <path d="M525 1392 V1402" class="line"/>
+  <path d="M360 1252 V1270" class="line-blue"/>
+
+  <text x="360" y="1510" text-anchor="middle" class="tiny">App Builder · diagram arsitektur runtime dan alur build end-to-end</text>
+</svg>

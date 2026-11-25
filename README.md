@@ -1,6 +1,6 @@
 # App Builder
 
-App Builder is a self-hosted, mobile-friendly Android IDE. Projects are kept in the browser's IndexedDB; a build sends text files in its manifest and only uploads missing binary assets, then builds an APK in an isolated Docker container.
+App Builder is a self-hosted, mobile-friendly Android IDE. Projects are kept in the browser's IndexedDB; a build sends text files in its manifest and binary assets to the server, then builds an APK in an isolated Docker container. Private builds can reuse their per-browser binary cache; public builds upload assets into isolated per-build storage.
 
 The current MVP supports single-module Android projects using Kotlin or Java with XML Views, debug and release APK builds, optional release signing, ZIP import/export, a Monaco editor, persistent build history, build log streaming, and configurable public/private access. It does not currently support Compose, NDK, or multi-module projects.
 
@@ -16,7 +16,7 @@ The practical baseline used for a small, single-user installation is:
 | RAM | 7 GB |
 | Free storage | 15 GB |
 
-This baseline is intended for one Android build at a time. Builds are serialized to avoid competing for memory and CPU. Android SDK layers, Gradle caches, imported projects, and APK artifacts use disk space over time, so leave additional headroom and periodically remove old data when needed.
+This baseline is intended for one Android build at a time. Builds are serialized to avoid competing for memory and CPU. Android SDK layers and Gradle dependency caches use disk space over time, so leave additional headroom and remove the Gradle cache when needed.
 
 ### Software
 
@@ -90,6 +90,8 @@ Example:
 
 In public mode, all app APIs—including cleanup—are public by design. Only use it when the host and its resources are intentionally open to visitors.
 
+Public build data is isolated per build and the server rejects projects larger than 10 MiB after file sizes are summed. Uploaded source/blob and Gradle dependency caches are removed when a build ends, so public builds download Gradle dependencies again; the APK, logs, and history expire after five minutes without server-side activity. An automatic server cleanup also expires abandoned public uploads/builds. Projects stored in browser IndexedDB are not removed. Private-mode server data remains persistent until manually deleted and retains the existing build-size limits.
+
 ## Build email notifications
 
 Email notification settings are global to this server and are available in private mode from the mail icon in the IDE. The recipient and success/failure toggles are stored in the server database. SMTP sender credentials are read only from `data/IDE.config`; the API never returns them to the browser. The tracked `IDE.config` contains blank placeholders only.
@@ -104,7 +106,7 @@ Check that the API is ready:
 curl http://localhost:8866/api/health
 ```
 
-Open `http://localhost:8866` in a browser. For a remote VPS, place the service behind HTTPS and publish/forward port `8866` through your reverse proxy.
+Open `http://localhost:8866` in a browser. For a remote server or personal computer, place the service behind HTTPS and publish/forward port `8866` through your reverse proxy.
 
 ## Run the API directly on the host
 
@@ -125,7 +127,7 @@ ANDROID_BUILDER_IMAGE=android-web-ide-builder:amd64 \
 
 1. Create a Kotlin or Java Empty App, or choose **Import project** on the dashboard to load an Android Studio ZIP from the device into IndexedDB.
 2. Edit files in the browser; project files are saved in IndexedDB.
-3. Choose **Build APK**, then select Debug or Release. The browser hashes project files (caching hashes in IndexedDB until file contents change), sends a manifest, and uploads only binary assets missing from this browser's cache.
+3. Choose **Build APK**, then select Debug or Release. The browser hashes project files (caching hashes in IndexedDB until file contents change) and sends a manifest. Private builds upload only binary assets missing from that browser's server cache; public builds upload assets for each build.
 4. The API verifies binary SHA-256 and size, assembles the Android project from text and owner-scoped immutable blobs, then validates the single-module structure.
 5. A Docker container runs Gradle `assembleDebug` or `assembleRelease` with CPU, memory, process, and timeout limits.
 6. Logs and build status are stored by the API and can be restored after a page refresh or browser restart. Successful APKs are available from the build panel.
@@ -136,14 +138,14 @@ Each browser project has a stable ID. A second build for that project is rejecte
 
 ## Storage and cleanup
 
-- `DATA_DIR/workspaces/<build-id>` contains temporary upload data and the assembled Gradle workspace while a build is running. New builds remove their workspace when they finish; the cleanup UI can remove leftovers from earlier runs.
+- Private builds use a temporary `DATA_DIR/workspaces/<build-id>` while building, then retain successful APKs, history, and binary cache until manually deleted.
+- Public builds use `DATA_DIR/public/{workspaces,blobs,artifacts,gradle}`. Build workspaces and uploaded binary/Gradle caches are removed when the build ends; APKs, logs, and history are removed after five minutes without server-side activity. Gradle dependencies are downloaded again for each public build.
 - `DATA_DIR/signing` contains temporary keystore and password files only while a signed release build is running; the worker removes them when it exits.
-- `DATA_DIR/artifacts/<build-id>.apk` contains successful APKs until they are explicitly deleted.
-- `DATA_DIR/blobs/sha256/<owner>/<prefix>/<sha256>` stores immutable binary assets scoped to an opaque per-browser cookie owner. Builds retain blob references while their history exists; deleting history releases refs and garbage-collects unreferenced blobs. Incomplete upload reservations expire after one hour.
-- `DATA_DIR/ide.db` stores build history and logs.
+- `DATA_DIR/artifacts/<build-id>.apk` and `DATA_DIR/blobs/sha256/<owner>/<prefix>/<sha256>` are private-mode storage. Private binary assets are cached per browser owner; deleting history releases refs and garbage-collects unreferenced blobs.
+- `DATA_DIR/ide.db` stores build history and logs; public records are removed after five minutes idle.
 - The Docker volume `androidide_gradle` stores downloaded Gradle and Maven dependencies. Deleting it saves disk space but the next build must download dependencies again.
 
-Open the drive icon in the web UI to inspect storage and choose what to remove. Active builds block cleanup. The history option also removes associated APKs, workspaces, and unreferenced binary blobs; browser projects in IndexedDB are not affected.
+Open the drive icon in the web UI to inspect storage and choose what to remove. Active builds block cleanup. Run `bash cache-clear.sh` on the server to manually remove public build records and temporary files; it refuses to run while a public build is active and does not touch private storage, browser IndexedDB, or the private shared Gradle dependency cache. The history option also removes associated APKs, workspaces, and unreferenced binary blobs; browser projects in IndexedDB are not affected.
 
 ## Security notes
 

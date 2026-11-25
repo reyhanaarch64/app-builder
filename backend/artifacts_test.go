@@ -38,7 +38,14 @@ func TestArtifactListingIsOwnerScopedAndIncludesAvailability(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if _, err := db.Exec(`INSERT INTO builds(id,project_id,owner_id,status,variant,created_at,artifact)
+		VALUES('library-build','project-library',?,'success','jar',?,'library-build.jar')`, ownerA, now); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(artifactDir, "artifact-present.apk"), []byte("apk"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(artifactDir, "library-build.jar"), []byte("jar"), 0640); err != nil {
 		t.Fatal(err)
 	}
 	server := &Server{db: db, dataDir: dataDir}
@@ -49,18 +56,26 @@ func TestArtifactListingIsOwnerScopedAndIncludesAvailability(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("artifact listing returned %d: %s", response.Code, response.Body.String())
 	}
-	var artifacts []APKArtifact
+	var artifacts []BuildArtifact
 	if err := json.Unmarshal(response.Body.Bytes(), &artifacts); err != nil {
 		t.Fatal(err)
 	}
-	if len(artifacts) != 2 {
-		t.Fatalf("listed %d artifacts for owner, want two", len(artifacts))
+	if len(artifacts) != 3 {
+		t.Fatalf("listed %d artifacts for owner, want three", len(artifacts))
 	}
-	if artifacts[0].BuildID != "artifact-present" || !artifacts[0].Available || artifacts[0].Size != 3 {
-		t.Fatalf("unexpected present APK metadata: %+v", artifacts[0])
+	byBuildID := make(map[string]BuildArtifact, len(artifacts))
+	for _, artifact := range artifacts {
+		byBuildID[artifact.BuildID] = artifact
 	}
-	if artifacts[1].BuildID != "artifact-missing" || artifacts[1].Available {
-		t.Fatalf("missing APK should remain visible but unavailable: %+v", artifacts[1])
+	if artifact := byBuildID["artifact-present"]; !artifact.Available || artifact.Size != 3 {
+		t.Fatalf("unexpected present APK metadata: %+v", artifact)
+	}
+	if artifact := byBuildID["artifact-missing"]; artifact.Available {
+		t.Fatalf("missing APK should remain visible but unavailable: %+v", artifact)
+	}
+	if artifact := byBuildID["library-build"]; artifact.ProjectType != "java-library" ||
+		artifact.Filename != "library-build.jar" || !artifact.Available || artifact.Size != 3 {
+		t.Fatalf("unexpected Java library artifact metadata: %+v", artifact)
 	}
 }
 

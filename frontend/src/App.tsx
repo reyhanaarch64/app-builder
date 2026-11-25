@@ -3,15 +3,20 @@ import Editor from '@monaco-editor/react'
 import Dexie, { type Table } from 'dexie'
 import JSZip from 'jszip'
 import {
-  Archive, ArrowLeft, Ban, Box, ChevronRight, Copy, Download, FileCode2, FilePlus2, FolderPlus, HardDrive, Mail,
-  LogOut, Menu, PackagePlus, Play, RefreshCw, Search, Smartphone, Trash2, Upload, WifiOff,
+  Activity, Archive, ArrowLeft, Ban, Box, ChevronRight, Copy, Download, FileCode2, FilePlus2, FileText,
+  FolderPlus, Gauge, HardDrive, Mail, LogOut, Menu, PackagePlus, Play, RefreshCw, Search, Server,
+  Smartphone, Trash2, Upload, WifiOff,
   X,
 } from 'lucide-react'
 import './App.css'
 
+type ProjectType = 'android' | 'java-library'
+type BuildVariant = 'debug' | 'release' | 'jar' | 'fat-jar'
+
 type Project = {
   id: string
   name: string
+  projectType?: ProjectType
   packageName: string
   language: 'kotlin' | 'java'
   templateId: string
@@ -38,24 +43,56 @@ type Build = {
   id: string
   projectId: string
   status: 'preparing' | 'assembling' | 'queued' | 'building' | 'success' | 'failed' | 'canceled'
-  variant: 'debug' | 'release'
+  variant: BuildVariant
   createdAt: string
   error?: string
   artifact?: string
+  startedAt?: string
+  finishedAt?: string
 }
 
+type HostResourceMetrics = {
+  cpuPercent: number
+  memoryUsedBytes: number
+  memoryTotalBytes: number
+  memoryAvailableBytes: number
+  memoryPercent: number
+  sampledAt: string
+}
+
+type BuildResourceMetrics = {
+  cpuPercent: number
+  memoryUsedBytes: number
+  memoryLimitBytes: number
+  memoryPercent: number
+  peakCpuPercent: number
+  peakMemoryUsedBytes: number
+  sampledAt: string
+}
+
+type BuildMonitor = {
+  buildId: string
+  status: Build['status']
+  variant: BuildVariant
+  error?: string
+  metrics?: BuildResourceMetrics
+}
+
+type MetricHistoryPoint = { cpu: number; memory: number }
+
 type BuildOptions = {
-  variant: Build['variant']
+  variant: BuildVariant
   keystore?: File
   keyAlias?: string
   storePassword?: string
   keyPassword?: string
 }
 
-type APKArtifact = {
+type BuildArtifact = {
   buildId: string
   projectId: string
   variant: string
+  projectType?: ProjectType
   createdAt: string
   filename: string
   size: number
@@ -108,10 +145,46 @@ type ProjectEditorState = {
   expanded: string[]
 }
 
+type AppDialogRequest = {
+  kind: 'confirm' | 'prompt' | 'alert'
+  title: string
+  message: string
+  confirmLabel?: string
+  cancelLabel?: string
+  placeholder?: string
+  initialValue?: string
+  destructive?: boolean
+}
+
 const editorStateKey = (projectId: string) => `android-web-ide.editorState.${projectId}`
 const accessModeKey = 'android-web-ide.accessMode'
 const offlineUnlockKey = 'android-web-ide.offlineUnlock'
 const defaultExpandedPaths = ['app', 'app/src', 'app/src/main']
+
+function projectTypeOf(project: Project): ProjectType {
+  return project.projectType ?? 'android'
+}
+
+function buildArtifactLabel(variant: BuildVariant): string {
+  return variant === 'jar' || variant === 'fat-jar' ? 'JAR' : 'APK'
+}
+
+function projectArtifactLabel(project: Project | null): string {
+  return project && projectTypeOf(project) === 'java-library' ? 'JAR' : 'APK'
+}
+
+function buildStatusLabel(status: Build['status']): string {
+  const labels: Record<Build['status'], string> = {
+    preparing: 'Menyiapkan',
+    assembling: 'Menyusun',
+    queued: 'Dalam antrean',
+    building: 'Sedang membangun',
+    success: 'Berhasil',
+    failed: 'Gagal',
+    canceled: 'Dibatalkan',
+  }
+  return labels[status]
+}
 
 function readProjectEditorState(projectId: string): ProjectEditorState | null {
   try {
@@ -152,6 +225,19 @@ const packagePath = (packageName: string) => packageName.replace(/\./g, '/')
 
 function emptyTemplate(project: Project): ProjectFile[] {
   const now = Date.now()
+  if (projectTypeOf(project) === 'java-library') {
+    const sourcePath = `src/main/java/${packagePath(project.packageName)}/Library.java`
+    const files: Record<string, string> = {
+      'settings.gradle.kts': `pluginManagement {\n    repositories {\n        gradlePluginPortal()\n        mavenCentral()\n    }\n}\ndependencyResolutionManagement {\n    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)\n    repositories { mavenCentral() }\n}\nrootProject.name = "${project.name}"\n`,
+      'build.gradle.kts': `plugins {\n    \`java-library\`\n}\n\ngroup = "${project.packageName}"\nversion = "1.0.0"\n\njava {\n    toolchain {\n        languageVersion.set(JavaLanguageVersion.of(17))\n    }\n}\n\ndependencies {\n    // Tambahkan dependency runtime di sini agar ikut ke fat JAR.\n}\n\ntasks.register<Jar>("fatJar") {\n    archiveClassifier.set("all")\n    duplicatesStrategy = DuplicatesStrategy.EXCLUDE\n    from(sourceSets.main.get().output)\n    dependsOn(configurations.runtimeClasspath)\n    from({ configurations.runtimeClasspath.get().filter { it.isFile }.map { zipTree(it) } })\n}\n`,
+      'gradle.properties': `org.gradle.jvmargs=-Xmx2048m\n`,
+      [sourcePath]: `package ${project.packageName};\n\npublic final class Library {\n    private Library() {}\n\n    public static String hello() {\n        return "Hello, ${project.name}!";\n    }\n}\n`,
+    }
+    return Object.entries(files).map(([path, content]) => ({
+      id: uid(), projectId: project.id, path, type: 'file', content,
+      size: new Blob([content]).size, createdAt: now, updatedAt: now,
+    }))
+  }
   const sourcePath = project.language === 'kotlin'
     ? `app/src/main/java/${packagePath(project.packageName)}/MainActivity.kt`
     : `app/src/main/java/${packagePath(project.packageName)}/MainActivity.java`
@@ -207,9 +293,6 @@ function buildTree(files: ProjectFile[]): TreeNode[] {
 }
 
 function validateBuildProject(project: Project, files: ProjectFile[]): string | null {
-  if (!/^([a-zA-Z_]\w*\.)+[a-zA-Z_]\w*$/.test(project.packageName)) return 'Package name tidak valid'
-  if (!Number.isInteger(project.minSdk) || !Number.isInteger(project.targetSdk) ||
-      project.minSdk < 1 || project.targetSdk < project.minSdk) return 'Rentang Min SDK dan Target SDK tidak valid'
   if (files.length === 0) return 'Project belum memiliki file'
   const paths = new Set<string>()
   for (const file of files) {
@@ -223,13 +306,26 @@ function validateBuildProject(project: Project, files: ProjectFile[]): string | 
   const settings = files.find(file => /(^|\/)settings\.gradle(\.kts)?$/.test(file.path))
   if (!settings) return 'settings.gradle atau settings.gradle.kts tidak ditemukan'
   const root = settings.path.includes('/') ? `${settings.path.slice(0, settings.path.lastIndexOf('/') + 1)}` : ''
+  if (projectTypeOf(project) === 'java-library') {
+    if (!paths.has(`${root}build.gradle`) && !paths.has(`${root}build.gradle.kts`)) {
+      return 'build.gradle atau build.gradle.kts tidak ditemukan'
+    }
+    if (!files.some(file => file.path.startsWith(`${root}src/main/java/`) && file.path.endsWith('.java'))) {
+      return 'Tambahkan minimal satu file Java di src/main/java'
+    }
+    if (files.length > 20000) return 'Proyek memiliki lebih dari 20.000 berkas.'
+    return null
+  }
+  if (!/^([a-zA-Z_]\w*\.)+[a-zA-Z_]\w*$/.test(project.packageName)) return 'Nama paket tidak valid.'
+  if (!Number.isInteger(project.minSdk) || !Number.isInteger(project.targetSdk) ||
+      project.minSdk < 1 || project.targetSdk < project.minSdk) return 'Rentang Min SDK dan Target SDK tidak valid.'
   if (!paths.has(`${root}app/build.gradle`) && !paths.has(`${root}app/build.gradle.kts`)) {
     return 'Module app/build.gradle atau app/build.gradle.kts tidak ditemukan'
   }
   if (!paths.has(`${root}app/src/main/AndroidManifest.xml`)) {
     return 'app/src/main/AndroidManifest.xml tidak ditemukan'
   }
-  if (files.length > 20000) return 'Project memiliki lebih dari 20.000 file'
+  if (files.length > 20000) return 'Proyek memiliki lebih dari 20.000 berkas.'
   return null
 }
 
@@ -323,14 +419,25 @@ function App() {
   const [editorStateProjectId, setEditorStateProjectId] = useState<string | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [buildOpen, setBuildOpen] = useState(false)
+  const [fullLogOpen, setFullLogOpen] = useState(false)
+  const [monitorDashboardOpen, setMonitorDashboardOpen] = useState(false)
+  const [hostMetrics, setHostMetrics] = useState<HostResourceMetrics | null>(null)
+  const [hostMetricsHistory, setHostMetricsHistory] = useState<MetricHistoryPoint[]>([])
+  const [hostMetricsError, setHostMetricsError] = useState('')
+  const [buildMetrics, setBuildMetrics] = useState<BuildResourceMetrics | null>(null)
+  const [buildMetricsHistory, setBuildMetricsHistory] = useState<MetricHistoryPoint[]>([])
   const [buildOptionsOpen, setBuildOptionsOpen] = useState(false)
   const [importingZip, setImportingZip] = useState(false)
+  const [importingGitHub, setImportingGitHub] = useState(false)
+  const [activeBuilds, setActiveBuilds] = useState<Record<string, Build>>({})
   const [buildStatus, setBuildStatus] = useState<Build['status'] | 'idle'>('idle')
   const [buildVariant, setBuildVariant] = useState<Build['variant']>('debug')
   const [buildCanceling, setBuildCanceling] = useState(false)
   const [logs, setLogs] = useState<string[]>([])
   const [buildId, setBuildId] = useState<string | null>(null)
   const [showCreate, setShowCreate] = useState(false)
+  const [appDialog, setAppDialog] = useState<AppDialogRequest | null>(null)
+  const [dialogInput, setDialogInput] = useState('')
   const [search, setSearch] = useState('')
   const [expanded, setExpanded] = useState<Set<string>>(new Set(defaultExpandedPaths))
   const [toast, setToast] = useState('')
@@ -338,7 +445,7 @@ function App() {
   const [storageLoading, setStorageLoading] = useState(false)
   const [storageStats, setStorageStats] = useState<StorageStats | null>(null)
   const [artifactsOpen, setArtifactsOpen] = useState(false)
-  const [artifacts, setArtifacts] = useState<APKArtifact[]>([])
+  const [artifacts, setArtifacts] = useState<BuildArtifact[]>([])
   const [artifactsLoading, setArtifactsLoading] = useState(false)
   const [artifactDeletingId, setArtifactDeletingId] = useState<string | null>(null)
   const [artifactsError, setArtifactsError] = useState('')
@@ -365,7 +472,9 @@ function App() {
   const buildPrepareInFlight = useRef(false)
   const buildCancelRequested = useRef(false)
   const pendingBuildId = useRef<string | null>(null)
+  const requestedBuildId = useRef<string | null>(null)
   const [buildHistory, setBuildHistory] = useState<Build[]>([])
+  const dialogResolver = useRef<((value: string | boolean | null) => void) | null>(null)
   const projectZipInput = useRef<HTMLInputElement>(null)
   const [restoreProjectId] = useState(() => localStorage.getItem('android-web-ide.activeProjectId'))
   const cachedAccessMode = localStorage.getItem(accessModeKey)
@@ -445,7 +554,7 @@ function App() {
     }
     const handlePwaError = (event: Event) => {
       const error = (event as CustomEvent<string>).detail
-      setToast(`PWA gagal disiapkan: ${error}`)
+      setToast(`Gagal menyiapkan PWA: ${error}`)
     }
     setIsInstalled(window.matchMedia('(display-mode: standalone)').matches ||
       ('standalone' in navigator && navigator.standalone === true))
@@ -521,7 +630,7 @@ function App() {
       setExpanded(new Set(state?.expanded ?? defaultExpandedPaths))
       setEditorStateProjectId(activeProjectId)
     }).catch(error => {
-      if (!disposed) setToast(error instanceof Error ? error.message : 'gagal memuat file project')
+      if (!disposed) setToast(error instanceof Error ? error.message : 'Gagal memuat berkas proyek.')
     })
     return () => { disposed = true }
   }, [activeProjectId])
@@ -535,7 +644,7 @@ function App() {
         expanded: [...expanded],
       } satisfies ProjectEditorState))
     } catch (error) {
-      setToast(error instanceof Error ? error.message : 'gagal menyimpan state editor')
+      setToast(error instanceof Error ? error.message : 'Gagal menyimpan status editor.')
     }
   }, [activeProjectId, editorStateProjectId, openTabs, activeFileId, expanded])
 
@@ -553,16 +662,19 @@ function App() {
     let disposed = false
     fetch(`/api/builds?projectId=${encodeURIComponent(activeProjectId)}`)
       .then(response => {
-        if (!response.ok) throw new Error('gagal memuat riwayat build')
+        if (!response.ok) throw new Error('Gagal memuat riwayat build.')
         return response.json() as Promise<Build[]>
       })
       .then(builds => {
         if (disposed) return
         setBuildHistory(builds)
-        const latest = builds[0]
-        if (latest) {
+        const requested = requestedBuildId.current
+        const selected = builds.find(build => build.id === requested) ?? builds[0]
+        if (selected) {
+          requestedBuildId.current = null
           setBuildOpen(true)
-          followBuild(latest)
+          followBuild(selected)
+          if (requested) setFullLogOpen(true)
         } else {
           setBuildId(null)
           setBuildStatus('idle')
@@ -571,7 +683,7 @@ function App() {
         }
       })
       .catch(error => {
-        if (!disposed) setToast(error instanceof Error ? error.message : 'gagal memuat riwayat build')
+        if (!disposed) setToast(error instanceof Error ? error.message : 'Gagal memuat riwayat build.')
       })
     return () => {
       disposed = true
@@ -579,6 +691,95 @@ function App() {
       buildEvents.current = null
     }
   }, [activeProjectId, authenticated, onlineAccess])
+
+  useEffect(() => {
+    if (!onlineAccess || !authenticated || activeProjectId) {
+      setActiveBuilds({})
+      return
+    }
+    let disposed = false
+    const refreshActiveBuilds = async () => {
+      try {
+        const response = await fetch('/api/builds/active')
+        if (!response.ok) throw new Error('Gagal memuat status build aktif.')
+        const builds = await response.json() as Build[]
+        if (!disposed) setActiveBuilds(Object.fromEntries(builds.map(build => [build.projectId, build])))
+      } catch (error) {
+        if (!disposed) setToast(error instanceof Error ? error.message : 'Gagal memuat status build aktif.')
+      }
+    }
+    void refreshActiveBuilds()
+    const timer = window.setInterval(() => void refreshActiveBuilds(), 3000)
+    return () => {
+      disposed = true
+      window.clearInterval(timer)
+    }
+  }, [activeProjectId, authenticated, onlineAccess])
+
+  useEffect(() => {
+    if (!onlineAccess || !monitorDashboardOpen || authMode !== 'private') {
+      setHostMetrics(null)
+      setHostMetricsHistory([])
+      setHostMetricsError('')
+      return
+    }
+    let disposed = false
+    const refreshHostMetrics = async () => {
+      try {
+        const response = await fetch('/api/monitor/host')
+        const body = await response.text()
+        if (!response.ok) throw new Error(body || `Gagal memuat metrik server (${response.status}).`)
+        const metrics = JSON.parse(body) as HostResourceMetrics
+        if (disposed) return
+        setHostMetrics(metrics)
+        setHostMetricsError('')
+        setHostMetricsHistory(previous => [...previous, {
+          cpu: metrics.cpuPercent, memory: metrics.memoryPercent,
+        }].slice(-60))
+      } catch (error) {
+        if (!disposed) setHostMetricsError(error instanceof Error ? error.message : 'Gagal memuat metrik server.')
+      }
+    }
+    void refreshHostMetrics()
+    const timer = window.setInterval(() => void refreshHostMetrics(), 2000)
+    return () => {
+      disposed = true
+      window.clearInterval(timer)
+    }
+  }, [authMode, monitorDashboardOpen, onlineAccess])
+
+  useEffect(() => {
+    if (!onlineAccess || !authenticated || authMode !== 'private' || !activeProjectId || !buildId) {
+      setBuildMetrics(null)
+      setBuildMetricsHistory([])
+      return
+    }
+    let disposed = false
+    const refreshBuildMetrics = async () => {
+      try {
+        const response = await fetch(`/api/monitor/builds/${encodeURIComponent(buildId)}`)
+        const body = await response.text()
+        if (!response.ok) throw new Error(body || `Gagal memuat metrik build (${response.status}).`)
+        const monitor = JSON.parse(body) as BuildMonitor
+        if (disposed) return
+        const metrics = monitor.metrics ?? null
+        setBuildMetrics(metrics)
+        if (metrics) {
+          setBuildMetricsHistory(previous => [...previous, {
+            cpu: metrics.cpuPercent, memory: metrics.memoryPercent,
+          }].slice(-60))
+        }
+      } catch (error) {
+        if (!disposed) setToast(error instanceof Error ? error.message : 'Gagal memuat metrik build.')
+      }
+    }
+    void refreshBuildMetrics()
+    const timer = window.setInterval(() => void refreshBuildMetrics(), 2000)
+    return () => {
+      disposed = true
+      window.clearInterval(timer)
+    }
+  }, [activeProjectId, authMode, authenticated, buildId, onlineAccess])
 
   useEffect(() => {
     if (!toast) return
@@ -589,6 +790,22 @@ function App() {
   const tree = useMemo(() => buildTree(
     search ? files.filter(f => f.path.toLowerCase().includes(search.toLowerCase())) : files
   ), [files, search])
+
+  function showAppDialog(request: AppDialogRequest): Promise<string | boolean | null> {
+    if (dialogResolver.current) return Promise.resolve(null)
+    setDialogInput(request.initialValue ?? '')
+    setAppDialog(request)
+    return new Promise(resolve => {
+      dialogResolver.current = resolve
+    })
+  }
+
+  function closeAppDialog(value: string | boolean | null) {
+    const resolve = dialogResolver.current
+    dialogResolver.current = null
+    setAppDialog(null)
+    resolve?.(value)
+  }
 
   async function submitLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -601,7 +818,7 @@ function App() {
         body: JSON.stringify({ password: loginPassword }),
       })
       const body = await response.json() as { error?: string; authenticated?: boolean }
-      if (!response.ok) throw new Error(body.error || 'login gagal')
+      if (!response.ok) throw new Error(body.error || 'Proses masuk gagal.')
       setAuthStatus({ mode: 'private', authenticated: true })
       setServerAvailable(true)
       setIsOnline(true)
@@ -633,16 +850,16 @@ function App() {
     if (shouldNotifyServer) {
       try {
         const response = await fetch('/api/auth/logout', { method: 'POST' })
-        if (!response.ok) throw new Error(await response.text() || 'logout server gagal')
+        if (!response.ok) throw new Error(await response.text() || 'Gagal keluar dari server.')
       } catch (error) {
-        setToast(error instanceof Error ? error.message : 'logout server gagal')
+        setToast(error instanceof Error ? error.message : 'Gagal keluar dari server.')
       }
     }
   }
 
   async function refreshStorageStats() {
     if (!onlineAccess) {
-      setToast('Kelola storage build butuh koneksi ke server')
+      setToast('Pengelolaan penyimpanan build memerlukan koneksi ke server.')
       return
     }
     setStorageLoading(true)
@@ -651,7 +868,7 @@ function App() {
       if (!response.ok) throw new Error(await response.text())
       setStorageStats(await response.json() as StorageStats)
     } catch (error) {
-      setToast(error instanceof Error ? error.message : 'gagal membaca penggunaan storage')
+      setToast(error instanceof Error ? error.message : 'Gagal membaca penggunaan penyimpanan.')
     } finally {
       setStorageLoading(false)
     }
@@ -659,7 +876,7 @@ function App() {
 
   function openStorage() {
     if (!onlineAccess) {
-      setToast('Kelola storage build butuh koneksi ke server')
+      setToast('Pengelolaan penyimpanan build memerlukan koneksi ke server.')
       return
     }
     setStorageOpen(true)
@@ -670,11 +887,12 @@ function App() {
     setDrawerOpen(false)
     setSearch('')
     setBuildOpen(false)
+    setFullLogOpen(false)
   }
 
   async function loadArtifacts() {
     if (!onlineAccess) {
-      setArtifactsError('daftar APK butuh koneksi ke server')
+      setArtifactsError('Daftar hasil build memerlukan koneksi ke server.')
       return
     }
     setArtifactsLoading(true)
@@ -682,10 +900,10 @@ function App() {
     try {
       const response = await fetch('/api/artifacts')
       const body = await response.text()
-      if (!response.ok) throw new Error(body || `gagal memuat daftar APK (${response.status})`)
-      setArtifacts(JSON.parse(body) as APKArtifact[])
+      if (!response.ok) throw new Error(body || `Gagal memuat daftar hasil build (${response.status}).`)
+      setArtifacts(JSON.parse(body) as BuildArtifact[])
     } catch (error) {
-      setArtifactsError(error instanceof Error ? error.message : 'gagal memuat daftar APK')
+      setArtifactsError(error instanceof Error ? error.message : 'Gagal memuat daftar hasil build.')
     } finally {
       setArtifactsLoading(false)
     }
@@ -696,19 +914,26 @@ function App() {
     void loadArtifacts()
   }
 
-  async function deleteArtifact(artifact: APKArtifact) {
+  async function deleteArtifact(artifact: BuildArtifact) {
     const projectName = projects.find(project => project.id === artifact.projectId)?.name ?? artifact.projectId
-    if (!confirm(`hapus ${artifact.filename} dari project "${projectName}"? riwayat build tetap disimpan.`)) return
+    const confirmed = await showAppDialog({
+      kind: 'confirm',
+      title: 'Hapus hasil build?',
+      message: `Hapus ${artifact.filename} dari proyek "${projectName}"? Riwayat build akan tetap disimpan.`,
+      confirmLabel: 'Hapus',
+      destructive: true,
+    })
+    if (confirmed !== true) return
     setArtifactDeletingId(artifact.buildId)
     setArtifactsError('')
     try {
       const response = await fetch(`/api/artifacts/${encodeURIComponent(artifact.buildId)}`, { method: 'DELETE' })
       const body = await response.text()
-      if (!response.ok) throw new Error(body || `gagal menghapus APK (${response.status})`)
+      if (!response.ok) throw new Error(body || `Gagal menghapus hasil build (${response.status}).`)
       setArtifacts(prev => prev.filter(item => item.buildId !== artifact.buildId))
-      setToast('APK dihapus; riwayat build tetap disimpan')
+      setToast('Hasil build dihapus. Riwayat build tetap disimpan.')
     } catch (error) {
-      setArtifactsError(error instanceof Error ? error.message : 'gagal menghapus APK')
+      setArtifactsError(error instanceof Error ? error.message : 'Gagal menghapus hasil build.')
     } finally {
       setArtifactDeletingId(null)
     }
@@ -716,17 +941,21 @@ function App() {
 
   async function cleanStorage() {
     if (!onlineAccess) {
-      setToast('Pembersihan storage build butuh koneksi ke server')
+      setToast('Pembersihan penyimpanan build memerlukan koneksi ke server.')
       return
     }
     if (!Object.values(cleanupOptions).some(Boolean)) {
-      setToast('Pilih data yang mau dibersihkan')
+      setToast('Pilih data yang akan dibersihkan.')
       return
     }
-    const confirmed = confirm(
-      `Lanjut bersihkan storage?${cleanupOptions.history ? '\nRiwayat, log, dan binary cache build akan dihapus.' : ''}${cleanupOptions.artifacts || cleanupOptions.history ? '\nAPK hasil build yang dipilih akan dihapus.' : ''}${cleanupOptions.gradleCache ? '\nCache Gradle dihapus dan perlu diunduh ulang saat build berikutnya.' : ''}`,
-    )
-    if (!confirmed) return
+    const confirmed = await showAppDialog({
+      kind: 'confirm',
+      title: 'Bersihkan penyimpanan?',
+      message: `Lanjutkan pembersihan penyimpanan?${cleanupOptions.history ? '\nRiwayat, log, dan cache berkas biner build akan dihapus.' : ''}${cleanupOptions.artifacts || cleanupOptions.history ? '\nHasil build yang dipilih akan dihapus.' : ''}${cleanupOptions.gradleCache ? '\nCache Gradle akan dihapus dan perlu diunduh ulang saat build berikutnya.' : ''}`,
+      confirmLabel: 'Bersihkan',
+      destructive: true,
+    })
+    if (confirmed !== true) return
     setStorageLoading(true)
     try {
       const response = await fetch('/api/maintenance/cleanup', {
@@ -738,9 +967,9 @@ function App() {
       let data: { error?: string; removed?: Record<string, number>; storage?: StorageStats }
       try { data = JSON.parse(body) as typeof data }
       catch { data = { error: body } }
-      if (!response.ok) throw new Error(data.error || `cleanup gagal (${response.status})`)
+      if (!response.ok) throw new Error(data.error || `Pembersihan gagal (${response.status}).`)
       setStorageStats(data.storage ?? null)
-      setToast(`storage dibersihkan: ${formatBytes(Object.values(data.removed ?? {}).reduce((sum, size) => sum + size, 0))} dibebaskan`)
+      setToast(`Penyimpanan dibersihkan. ${formatBytes(Object.values(data.removed ?? {}).reduce((sum, size) => sum + size, 0))} berhasil dibebaskan.`)
       if (cleanupOptions.history) {
         setBuildHistory([])
         setBuildId(null)
@@ -752,7 +981,7 @@ function App() {
         if (historyResponse.ok) setBuildHistory(await historyResponse.json() as Build[])
       }
     } catch (error) {
-      setToast(error instanceof Error ? error.message : 'cleanup gagal')
+      setToast(error instanceof Error ? error.message : 'Pembersihan gagal.')
     } finally {
       setStorageLoading(false)
     }
@@ -767,7 +996,7 @@ function App() {
     setProjects(prev => [project, ...prev])
     setActiveProjectId(project.id)
     setShowCreate(false)
-    setToast('Project berhasil dibuat')
+    setToast('Proyek berhasil dibuat.')
   }
 
   async function saveFile(file: ProjectFile, content: string) {
@@ -781,7 +1010,7 @@ function App() {
     if (!activeFile || content === undefined) return
     setFiles(prev => prev.map(f => f.id === activeFile.id ? { ...f, content, sha256: '' } : f))
     void db.files.update(activeFile.id, { sha256: undefined }).catch(error => {
-      setToast(error instanceof Error ? error.message : 'gagal menginvalidasi hash file')
+      setToast(error instanceof Error ? error.message : 'Gagal memperbarui hash berkas.')
     })
     const existingTimer = autoSaveTimers.current.get(activeFile.id)
     if (existingTimer) window.clearTimeout(existingTimer)
@@ -796,7 +1025,14 @@ function App() {
   }
 
   async function deleteProject(project: Project) {
-    if (!confirm(`Hapus project "${project.name}"?`)) return
+    const confirmed = await showAppDialog({
+      kind: 'confirm',
+      title: 'Hapus proyek?',
+      message: `Hapus proyek "${project.name}" beserta seluruh berkasnya?`,
+      confirmLabel: 'Hapus',
+      destructive: true,
+    })
+    if (confirmed !== true) return
     await db.files.where('projectId').equals(project.id).delete()
     await db.projects.delete(project.id)
     localStorage.removeItem(editorStateKey(project.id))
@@ -804,31 +1040,38 @@ function App() {
     if (activeProjectId === project.id) setActiveProjectId(null)
   }
 
-  async function exportProject() {
-    if (!activeProject) return
-    const zip = new JSZip()
-    for (const file of files) {
-      if (file.binary) zip.file(file.path, file.binary)
-      else zip.file(file.path, file.content ?? '')
+  async function exportProject(project = activeProject) {
+    if (!project) return
+    try {
+      const projectFiles = project.id === activeProjectId
+        ? files
+        : await db.files.where('projectId').equals(project.id).toArray()
+      const zip = new JSZip()
+      for (const file of projectFiles) {
+        if (file.binary) zip.file(file.path, file.binary)
+        else zip.file(file.path, file.content ?? '')
+      }
+      const blob = await zip.generateAsync({ type: 'blob' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${project.name.replace(/\s+/g, '-')}.zip`
+      a.click()
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (error) {
+      setToast(error instanceof Error ? `Gagal mengekspor proyek: ${error.message}` : 'Gagal mengekspor proyek.')
     }
-    const blob = await zip.generateAsync({ type: 'blob' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `${activeProject.name.replace(/\s+/g, '-')}.zip`
-    a.click()
-    URL.revokeObjectURL(url)
   }
 
   async function importZip(file: File) {
     if (importingZip) return
     setImportingZip(true)
     try {
-      if (file.size > 250 * 1024 * 1024) throw new Error('Ukuran ZIP melebihi 250 MB')
+      if (file.size > 250 * 1024 * 1024) throw new Error('Ukuran arsip ZIP melebihi 250 MB.')
       const zip = await JSZip.loadAsync(file)
       const projectId = uid()
       const now = Date.now()
-      const projectName = file.name.replace(/\.zip$/i, '') || 'Imported App'
+      const projectName = file.name.replace(/\.zip$/i, '') || 'Aplikasi Impor'
       const imported: ProjectFile[] = []
       let totalBytes = 0
       for (const [path, entry] of Object.entries(zip.files)) {
@@ -836,7 +1079,7 @@ function App() {
         if (!clean || entry.dir) continue
         if (clean.startsWith('/') || clean.includes('\\') ||
             clean.split('/').some(part => !part || part === '.' || part === '..')) {
-          throw new Error(`Path ZIP tidak valid: ${clean}`)
+          throw new Error(`Lokasi berkas dalam ZIP tidak valid: ${clean}`)
         }
         const segments = clean.split('/')
         if (segments.some(part => ['.git', '.idea', '.gradle'].includes(part)) ||
@@ -847,11 +1090,11 @@ function App() {
         const content = text ? await entry.async('string') : undefined
         const binary = text ? undefined : await entry.async('blob')
         const size = binary?.size ?? new Blob([content ?? '']).size
-        if (size > 50 * 1024 * 1024) throw new Error(`File ZIP melebihi 50 MB: ${clean}`)
+        if (size > 50 * 1024 * 1024) throw new Error(`Berkas dalam ZIP melebihi 50 MB: ${clean}`)
         totalBytes += size
-        if (totalBytes > 250 * 1024 * 1024) throw new Error('Ukuran project setelah diekstrak melebihi 250 MB')
+        if (totalBytes > 250 * 1024 * 1024) throw new Error('Ukuran proyek setelah diekstrak melebihi 250 MB.')
         imported.push({ id: uid(), projectId, path: clean, type: 'file', content, binary, size, createdAt: now, updatedAt: now })
-        if (imported.length > 20000) throw new Error('Project memiliki lebih dari 20.000 file')
+        if (imported.length > 20000) throw new Error('Proyek memiliki lebih dari 20.000 berkas.')
       }
 
       const settingsFiles = imported.filter(file => /(^|\/)settings\.gradle(\.kts)?$/.test(file.path))
@@ -864,7 +1107,7 @@ function App() {
         imported.some(file => file.path === `${root}app/src/main/AndroidManifest.xml`))
       if (projectRoots.length !== 1) {
         throw new Error(projectRoots.length > 1
-          ? 'ZIP berisi lebih dari satu project Android; import project single-module saja'
+          ? 'Arsip ZIP berisi lebih dari satu proyek Android. Impor hanya mendukung proyek dengan satu modul.'
           : 'ZIP harus berisi settings.gradle, app/build.gradle, dan AndroidManifest.xml')
       }
       const root = projectRoots[0]
@@ -887,7 +1130,7 @@ function App() {
       })
       setProjects(prev => [project, ...prev])
       setActiveProjectId(projectId)
-      setToast('Project ZIP berhasil diimpor')
+      setToast('Arsip ZIP proyek berhasil diimpor.')
     } catch (error) {
       setToast(error instanceof Error ? error.message : 'Gagal mengimpor ZIP')
     } finally {
@@ -895,13 +1138,49 @@ function App() {
     }
   }
 
+  async function importGitHubProject() {
+    if (importingZip || importingGitHub) return
+    const value = await showAppDialog({
+      kind: 'prompt',
+      title: 'Impor dari GitHub',
+      message: 'Masukkan URL repositori GitHub publik yang berisi proyek Android.',
+      placeholder: 'https://github.com/pemilik/repositori',
+      confirmLabel: 'Impor',
+    })
+    if (typeof value !== 'string' || !value.trim()) return
+    const repositoryURL = value.trim()
+    setImportingGitHub(true)
+    try {
+      const response = await fetch('/api/import/github', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: repositoryURL.trim() }),
+      })
+      if (!response.ok) throw new Error(await response.text() || 'Gagal mengunduh repositori dari GitHub.')
+      const archive = await response.blob()
+      const repositoryName = repositoryURL.trim().replace(/\/+$/, '').replace(/\.git$/i, '').split('/').pop() || 'github-project'
+      await importZip(new File([archive], `${repositoryName}.zip`, { type: 'application/zip' }))
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'Gagal mengimpor repositori GitHub.')
+    } finally {
+      setImportingGitHub(false)
+    }
+  }
+
   async function createFile() {
     if (!activeProject) return
-    const path = prompt('Path file baru (contoh app/src/main/java/Main.kt)')
-    if (!path) return
+    const value = await showAppDialog({
+      kind: 'prompt',
+      title: 'Buat file baru',
+      message: 'Masukkan path file relatif dari root project.',
+      placeholder: 'app/src/main/java/Main.kt',
+      confirmLabel: 'Buat file',
+    })
+    if (typeof value !== 'string' || !value) return
+    const path = value
     const clean = path.replace(/^\/+/, '')
-    if (clean.includes('..') || clean.includes('\\')) { setToast('Path file tidak valid'); return }
-    if (files.some(f => f.path === clean)) { setToast('File sudah ada'); return }
+    if (clean.includes('..') || clean.includes('\\')) { setToast('Lokasi berkas tidak valid.'); return }
+    if (files.some(f => f.path === clean)) { setToast('Berkas sudah ada.'); return }
     let content = ''
     if (clean.endsWith('.xml') && clean.includes('/res/layout/')) content = '<?xml version="1.0" encoding="utf-8"?>\n<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent"/>\n'
     const filename = clean.split('/').pop() || 'NewClass'
@@ -916,7 +1195,14 @@ function App() {
   }
 
   async function deleteFile(file: ProjectFile) {
-    if (!confirm(`Hapus "${file.path}"?`)) return
+    const confirmed = await showAppDialog({
+      kind: 'confirm',
+      title: 'Hapus file?',
+      message: `Hapus "${file.path}" dari project?`,
+      confirmLabel: 'Hapus',
+      destructive: true,
+    })
+    if (confirmed !== true) return
     await db.files.delete(file.id)
     setFiles(prev => prev.filter(f => f.id !== file.id))
     setOpenTabs(prev => prev.filter(f => f.id !== file.id))
@@ -929,6 +1215,8 @@ function App() {
     setBuildVariant(build.variant)
     setBuildStatus(build.status)
     setLogs([])
+    setBuildMetrics(null)
+    setBuildMetricsHistory([])
     setBuildOpen(true)
     const events = new EventSource(`/api/builds/${build.id}/logs`)
     buildEvents.current = events
@@ -950,12 +1238,18 @@ function App() {
     })
   }
 
+  function openBuildFromDashboard(build: Build) {
+    requestedBuildId.current = build.id
+    setMonitorDashboardOpen(false)
+    setActiveProjectId(build.projectId)
+  }
+
   async function copyLogs() {
     try {
       await navigator.clipboard.writeText(logs.join('\n'))
-      setToast('log berhasil disalin')
+      setToast('Log berhasil disalin.')
     } catch (error) {
-      setToast(error instanceof Error ? `gagal menyalin log: ${error.message}` : 'gagal menyalin log')
+      setToast(error instanceof Error ? `Gagal menyalin log: ${error.message}` : 'Gagal menyalin log.')
     }
   }
 
@@ -978,7 +1272,7 @@ function App() {
       return
     }
     if (!onlineAccess) {
-      setToast('pembatalan build butuh koneksi ke server')
+      setToast('Pembatalan build memerlukan koneksi ke server.')
       return
     }
     setBuildCanceling(true)
@@ -987,21 +1281,21 @@ function App() {
       const response = await fetch(`/api/builds/${encodeURIComponent(currentBuildId)}`, { method: 'DELETE' })
       if (!response.ok) {
         const message = await response.text()
-        throw new Error(message || `gagal membatalkan build (${response.status})`)
+        throw new Error(message || `Gagal membatalkan build (${response.status}).`)
       }
       if (controller) {
         controller.abort()
         setBuildStatus('canceled')
         setLogs(prev => [...prev, 'Build dibatalkan.'])
-        setToast('build dibatalkan')
+        setToast('Build dibatalkan.')
       } else {
         waitForBuildEnd = buildEvents.current !== null
         if (!waitForBuildEnd) setBuildStatus('canceled')
         setLogs(prev => [...prev, 'Permintaan pembatalan build dikirim, menunggu worker berhenti...'])
-        setToast('permintaan pembatalan build dikirim')
+        setToast('Permintaan pembatalan build dikirim.')
       }
     } catch (error) {
-      setToast(error instanceof Error ? error.message : 'gagal membatalkan build')
+      setToast(error instanceof Error ? error.message : 'Gagal membatalkan build.')
     } finally {
       if (!waitForBuildEnd) setBuildCanceling(false)
     }
@@ -1009,7 +1303,7 @@ function App() {
 
   function openBuildOptions() {
     if (!onlineAccess) {
-      setToast('Build APK butuh koneksi ke server')
+      setToast(`Build ${projectArtifactLabel(activeProject)} memerlukan koneksi ke server.`)
       return
     }
     if (!activeProject) return
@@ -1047,7 +1341,12 @@ function App() {
     try {
       const manifestFiles = await createBuildManifest(buildFiles, controller.signal)
       const totalBytes = manifestFiles.reduce((sum, file) => sum + file.size, 0)
-      if (totalBytes > 250 * 1024 * 1024) throw new Error('Ukuran project melebihi 250 MB')
+      const maxProjectBytes = authMode === 'public' ? 10 * 1024 * 1024 : 250 * 1024 * 1024
+      if (totalBytes > maxProjectBytes) {
+        throw new Error(authMode === 'public'
+          ? 'Ukuran project mode publik melebihi 10 MiB'
+          : 'Ukuran project melebihi 250 MB')
+      }
       buildPrepareInFlight.current = true
       const response = await fetch('/api/builds/prepare', {
         method: 'POST',
@@ -1056,6 +1355,7 @@ function App() {
         body: JSON.stringify({
           projectId: activeProject.id,
           idempotencyKey: crypto.randomUUID(),
+          projectType: projectTypeOf(activeProject),
           variant: options.variant,
           files: manifestFiles,
         }),
@@ -1067,12 +1367,12 @@ function App() {
       catch { data = { error: body || `request gagal (${response.status})`, build: {} as Build, missingBlobs: [] } }
       if (response.status === 409 && data.build?.id) {
         buildCancelRequested.current = false
-        setToast('Project ini masih punya build aktif')
+        setToast('Proyek ini masih memiliki build aktif.')
         followBuild(data.build)
         return
       }
       if (!response.ok) throw new Error(data.error || body || `Gagal menyiapkan build (${response.status})`)
-      if (!data.build?.id) throw new Error('server tidak mengembalikan reservasi build')
+      if (!data.build?.id) throw new Error('Server tidak mengembalikan reservasi build.')
       const buildReservation = data.build
       reservation = buildReservation
       pendingBuildId.current = buildReservation.id
@@ -1088,13 +1388,13 @@ function App() {
         const cancelResponse = await fetch(`/api/builds/${encodeURIComponent(buildReservation.id)}`, { method: 'DELETE' })
         if (!cancelResponse.ok) {
           const message = await cancelResponse.text()
-          throw new Error(message || `gagal membatalkan build (${cancelResponse.status})`)
+          throw new Error(message || `Gagal membatalkan build (${cancelResponse.status}).`)
         }
         controller.abort()
         buildCancelRequested.current = false
         setBuildStatus('canceled')
         setLogs(prev => [...prev, 'Build dibatalkan.'])
-        setToast('build dibatalkan')
+        setToast('Build dibatalkan.')
         return
       }
       const binaryByPath = new Map(buildFiles.map(file => [file.path, file] as const))
@@ -1106,7 +1406,7 @@ function App() {
         }))
       for (const [index, hash] of data.missingBlobs.entries()) {
         const binary = binaryByHash.get(hash)
-        if (!binary) throw new Error(`binary ${hash} tidak ditemukan di IndexedDB`)
+        if (!binary) throw new Error(`Berkas biner ${hash} tidak ditemukan di IndexedDB.`)
         setLogs(prev => [...prev, `Mengupload binary ${index + 1}/${data.missingBlobs.length}...`])
         const uploadResponse = await fetch(`/api/builds/${buildReservation.id}/blobs/${hash}`, {
           method: 'PUT',
@@ -1114,7 +1414,7 @@ function App() {
           signal: controller.signal,
           body: binary,
         })
-        if (!uploadResponse.ok) throw new Error(await uploadResponse.text() || `Upload binary gagal (${uploadResponse.status})`)
+        if (!uploadResponse.ok) throw new Error(await uploadResponse.text() || `Pengunggahan berkas biner gagal (${uploadResponse.status}).`)
       }
       setBuildStatus('assembling')
       setLogs(prev => [...prev, 'Binary lengkap, merakit workspace build...'])
@@ -1164,16 +1464,16 @@ function App() {
 
   async function installApp() {
     if (!installPrompt) {
-      setToast('Buka menu browser lalu pilih "Install app" atau "Add to Home Screen"')
+      setToast('Buka menu peramban, lalu pilih "Pasang aplikasi" atau "Tambahkan ke layar utama".')
       return
     }
     try {
       await installPrompt.prompt()
       const choice = await installPrompt.userChoice
-      if (choice.outcome === 'accepted') setToast('Android Web IDE berhasil dipasang')
+      if (choice.outcome === 'accepted') setToast('Droid Studio berhasil dipasang.')
       setInstallPrompt(null)
     } catch (error) {
-      setToast(error instanceof Error ? `gagal memasang app: ${error.message}` : 'gagal memasang app')
+      setToast(error instanceof Error ? `Gagal memasang aplikasi: ${error.message}` : 'Gagal memasang aplikasi.')
     }
   }
 
@@ -1184,7 +1484,7 @@ function App() {
     try {
       const settingsResponse = await fetch('/api/notifications/settings')
       const settings = await settingsResponse.json() as NotificationSettings & { error?: string }
-      if (!settingsResponse.ok) throw new Error(settings.error || 'gagal membaca pengaturan email')
+      if (!settingsResponse.ok) throw new Error(settings.error || 'Gagal membaca pengaturan email.')
       setNotificationSettings(settings)
     } catch (error) {
       setNotificationError(error instanceof Error ? error.message : 'gagal membaca pengaturan notifikasi')
@@ -1209,9 +1509,9 @@ function App() {
         }),
       })
       const data = await response.json() as NotificationSettings & { error?: string }
-      if (!response.ok) throw new Error(data.error || 'gagal menyimpan pengaturan email')
+      if (!response.ok) throw new Error(data.error || 'Gagal menyimpan pengaturan email.')
       setNotificationSettings(data)
-      setToast('pengaturan email tersimpan')
+      setToast('Pengaturan email tersimpan.')
     } catch (error) {
       setNotificationError(error instanceof Error ? error.message : 'gagal menyimpan pengaturan email')
     } finally {
@@ -1267,36 +1567,39 @@ function App() {
       <header className="topbar">
         <button className="icon-btn" onClick={() => setDrawerOpen(v => !v)}><Menu size={20}/></button>
         <div className="brand"><div className="brand-mark"><Box size={18}/></div><span>Droid Studio</span></div>
-        {activeProject && <button className="exit-project-btn" title="Keluar dari project" aria-label="Keluar dari project" onClick={exitProject}><ArrowLeft size={17}/><span>Projects</span></button>}
-        {activeProject && <div className="project-title">{activeProject.name}</div>}
-        {!onlineAccess && <div className="offline-indicator"><WifiOff size={14}/><span>offline · edit lokal</span></div>}
-        {!isInstalled && <button className="install-btn" title="Install Android Web IDE" onClick={() => void installApp()}><Smartphone size={16}/><span>Install</span></button>}
-        <button className="build-btn" onClick={openBuildOptions} disabled={!onlineAccess || !activeProject || buildCanceling || buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building'} title={!onlineAccess ? 'Build APK butuh koneksi ke server' : undefined}>
-          <Play size={16} fill="currentColor"/><span>{!onlineAccess ? 'Offline' : buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building' ? 'Building...' : 'Build APK'}</span>
+        {!activeProject && monitorDashboardOpen && <button className="exit-project-btn" title="Kembali ke ruang kerja" aria-label="Kembali ke ruang kerja" onClick={() => setMonitorDashboardOpen(false)}><ArrowLeft size={17}/><span>Ruang kerja</span></button>}
+        {!onlineAccess && <div className="offline-indicator"><WifiOff size={14}/><span>Offline · edit lokal</span></div>}
+        {!isInstalled && <button className="install-btn" title="Pasang Droid Studio" onClick={() => void installApp()}><Smartphone size={16}/><span>Pasang</span></button>}
+        {activeProject && buildId && <button className="icon-btn" title={buildOpen ? 'Sembunyikan panel build' : 'Tampilkan panel build'} aria-label={buildOpen ? 'Sembunyikan panel build' : 'Tampilkan panel build'} onClick={() => setBuildOpen(open => !open)}><Activity size={18}/></button>}
+        <button className="build-btn" onClick={openBuildOptions} disabled={!onlineAccess || !activeProject || buildCanceling || buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building'} title={!onlineAccess ? `Build ${projectArtifactLabel(activeProject)} memerlukan koneksi ke server` : undefined}>
+        <Play size={16} fill="currentColor"/><span>{!onlineAccess ? 'Offline' : buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building' ? 'Sedang membangun…' : `Build ${projectArtifactLabel(activeProject)}`}</span>
         </button>
-        <button className="icon-btn" title={onlineAccess ? 'APK tersimpan' : 'Perlu koneksi ke server'} onClick={openArtifacts} disabled={!onlineAccess}><Archive size={18}/></button>
-        {authMode === 'private' && <button className="icon-btn" title={onlineAccess ? 'Notifikasi email build' : 'Perlu koneksi ke server'} onClick={() => void openNotifications()} disabled={!onlineAccess}><Mail size={18}/></button>}
-        <button className="icon-btn storage-btn" title={onlineAccess ? 'Kelola storage build' : 'Perlu koneksi ke server'} onClick={openStorage} disabled={!onlineAccess}><HardDrive size={18}/></button>
-        {authMode === 'private' && <button className="icon-btn" title="Logout" onClick={logout}><LogOut size={18}/></button>}
+        <button className="icon-btn" title={onlineAccess ? 'Arsip hasil build' : 'Memerlukan koneksi ke server'} aria-label="Arsip hasil build" onClick={openArtifacts} disabled={!onlineAccess}><Archive size={18}/></button>
+        {authMode === 'private' && <button className="icon-btn" title={onlineAccess ? 'Notifikasi email build' : 'Memerlukan koneksi ke server'} aria-label="Notifikasi email build" onClick={() => void openNotifications()} disabled={!onlineAccess}><Mail size={18}/></button>}
+        <button className="icon-btn storage-btn" title={onlineAccess ? 'Kelola penyimpanan build' : 'Memerlukan koneksi ke server'} aria-label="Kelola penyimpanan build" onClick={openStorage} disabled={!onlineAccess}><HardDrive size={18}/></button>
+        {authMode === 'private' && <button className="icon-btn" title="Keluar" aria-label="Keluar" onClick={logout}><LogOut size={18}/></button>}
       </header>
 
       <aside className={`sidebar ${drawerOpen ? 'open' : ''}`}>
         <div className="sidebar-head">
-          <div><small>WORKSPACE</small><strong>{activeProject?.name || 'Projects'}</strong></div>
-          <button className="icon-btn" onClick={() => setDrawerOpen(false)}><X size={17}/></button>
+          <div><small>{activeProject ? 'PENJELAJAH FILE' : 'RUANG KERJA'}</small><strong>{activeProject?.name || 'Proyek'}</strong></div>
+          <div className="sidebar-head-actions">
+            {activeProject && <button className="icon-btn close-project-btn" title="Tutup proyek" aria-label="Tutup proyek" onClick={exitProject}><ArrowLeft size={17}/></button>}
+            <button className="icon-btn" title="Tutup laci" aria-label="Tutup laci" onClick={() => setDrawerOpen(false)}><X size={17}/></button>
+          </div>
         </div>
         {activeProject ? (
           <>
             <div className="sidebar-actions">
-              <label className="tool-btn" title="Import ZIP"><Upload size={15}/><input type="file" accept=".zip" disabled={importingZip} onChange={event => {
+              <label className="tool-btn" title="Impor ZIP"><Upload size={15}/><input type="file" accept=".zip" disabled={importingZip} onChange={event => {
                 const input = event.currentTarget
                 const file = input.files?.[0]
                 input.value = ''
                 if (file) void importZip(file)
               }}/></label>
-              <button className="tool-btn" title="File baru" onClick={createFile}><FilePlus2 size={15}/></button>
-              <button className="tool-btn" title="Export ZIP" onClick={exportProject}><Download size={15}/></button>
-              <button className="tool-btn" title="Folder baru"><FolderPlus size={15}/></button>
+              <button className="tool-btn" title="Buat file" aria-label="Buat file" onClick={createFile}><FilePlus2 size={15}/></button>
+              <button className="tool-btn" title="Ekspor ZIP" aria-label="Ekspor ZIP" onClick={() => void exportProject()}><Download size={15}/></button>
+              <button className="tool-btn" title="Buat folder" aria-label="Buat folder"><FolderPlus size={15}/></button>
             </div>
             <div className="search-box"><Search size={14}/><input placeholder="Cari file" value={search} onChange={e => setSearch(e.target.value)}/></div>
             <div className="tree">{renderTree(tree)}</div>
@@ -1305,14 +1608,21 @@ function App() {
           <div className="project-list">
             {projects.map(project => (
               <article className="project-card" key={project.id}>
-                <button className="project-open" onClick={() => setActiveProjectId(project.id)}>
-                  <div className="app-icon">A</div>
-                  <div><strong>{project.name}</strong><span>{project.packageName}</span></div>
+                <button className="project-open" onClick={() => { setMonitorDashboardOpen(false); setActiveProjectId(project.id) }}>
+                  <div className="app-icon">{projectTypeOf(project) === 'java-library' ? 'J' : 'A'}</div>
+                  <div><strong>{project.name}</strong><span>{project.packageName}</span>
+                    {activeBuilds[project.id] && <AnimatedBuildStatus variant={activeBuilds[project.id].variant}/>}
+                  </div>
                 </button>
-                <button className="icon-btn" onClick={() => deleteProject(project)}><Trash2 size={15}/></button>
+                <div className="project-card-actions">
+                  <button className="icon-btn" title="Ekspor ZIP proyek" aria-label={`Ekspor ${project.name} sebagai ZIP`}
+                    onClick={() => void exportProject(project)}><Download size={15}/></button>
+                  <button className="icon-btn" title="Hapus proyek" aria-label={`Hapus ${project.name}`}
+                    onClick={() => void deleteProject(project)}><Trash2 size={15}/></button>
+                </div>
               </article>
             ))}
-            {projects.length === 0 && <div className="empty-state"><Box size={38}/><strong>Belum ada project</strong><span>Buat project Android pertama.</span></div>}
+            {projects.length === 0 && <div className="empty-state"><Box size={38}/><strong>Belum ada proyek</strong><span>Buat proyek Android pertama.</span></div>}
           </div>
         )}
       </aside>
@@ -1342,11 +1652,16 @@ function App() {
           </>
         ) : (
           <div className="home">
-            <div className="home-head"><div><small>ANDROID PROJECTS</small><h1>Workspace</h1></div>
-              <div className="home-actions">
-                <button className="tool-btn artifact-dashboard-btn" onClick={openArtifacts} disabled={!onlineAccess}><Archive size={16}/>APK tersimpan</button>
-                <button className="tool-btn artifact-dashboard-btn" onClick={() => projectZipInput.current?.click()} disabled={importingZip}>
-                  <Upload size={16}/>{importingZip ? 'Memproses ZIP...' : 'Import project'}
+            <div className="home-head"><div><small>{monitorDashboardOpen ? 'PEMANTAUAN SERVER' : 'PROYEK ANDROID'}</small><h1>{monitorDashboardOpen ? 'Monitor server' : 'Ruang kerja'}</h1></div>
+              {!monitorDashboardOpen && <div className="home-actions">
+                {authMode === 'private' && <button className="tool-btn artifact-dashboard-btn" onClick={() => setMonitorDashboardOpen(true)} disabled={!onlineAccess}><Gauge size={16}/>Monitor server</button>}
+                <button className="tool-btn artifact-dashboard-btn" onClick={openArtifacts} disabled={!onlineAccess}><Archive size={16}/>Arsip hasil build</button>
+                <button className="tool-btn artifact-dashboard-btn" onClick={() => projectZipInput.current?.click()} disabled={importingZip || importingGitHub}>
+                  <Upload size={16}/>{importingZip ? 'Memproses ZIP…' : 'Impor proyek'}
+                </button>
+                <button className="tool-btn artifact-dashboard-btn" onClick={() => void importGitHubProject()}
+                  disabled={!onlineAccess || importingZip || importingGitHub}>
+                  <Download size={16}/>{importingGitHub ? 'Mengunduh repositori…' : 'Impor dari GitHub'}
                 </button>
                 <input ref={projectZipInput} type="file" accept=".zip" style={{ display: 'none' }} onChange={event => {
                   const input = event.currentTarget
@@ -1354,34 +1669,102 @@ function App() {
                   input.value = ''
                   if (file) void importZip(file)
                 }}/>
-                <button className="primary-btn" onClick={() => setShowCreate(true)}><PackagePlus size={17}/>Project baru</button>
-              </div>
+                <button className="primary-btn" onClick={() => setShowCreate(true)}><PackagePlus size={17}/>Proyek baru</button>
+              </div>}
             </div>
-            <div className="project-grid">
+            {monitorDashboardOpen && authMode === 'private' ? (
+              <MonitorDashboard
+                metrics={hostMetrics}
+                history={hostMetricsHistory}
+                error={hostMetricsError}
+                builds={Object.values(activeBuilds)}
+                projects={projects}
+                onOpenBuild={openBuildFromDashboard}
+              />
+            ) : (
+              <div className="project-grid">
               {projects.map(project => (
                 <article className="project-card large" key={project.id}>
                   <button className="project-open" onClick={() => setActiveProjectId(project.id)}>
-                    <div className="app-icon large-icon">{project.name[0]?.toUpperCase()}</div>
-                    <div><strong>{project.name}</strong><span>{project.language.toUpperCase()} • SDK {project.minSdk}+</span><small>{project.packageName}</small></div>
+                    <div className="app-icon large-icon">{projectTypeOf(project) === 'java-library' ? 'J' : project.name[0]?.toUpperCase()}</div>
+                    <div><strong>{project.name}</strong><span>{projectTypeOf(project) === 'java-library' ? 'PUSTAKA JAVA' : `${project.language.toUpperCase()} • SDK ${project.minSdk}+`}</span><small>{project.packageName}</small>
+                      {activeBuilds[project.id] && <AnimatedBuildStatus variant={activeBuilds[project.id].variant}/>}
+                    </div>
                   </button>
-                  <button className="icon-btn" onClick={() => deleteProject(project)}><Trash2 size={16}/></button>
+                  <div className="project-card-actions">
+                    <button className="icon-btn" title="Ekspor ZIP proyek" aria-label={`Ekspor ${project.name} sebagai ZIP`}
+                      onClick={() => void exportProject(project)}><Download size={16}/></button>
+                    <button className="icon-btn" title="Hapus proyek" aria-label={`Hapus ${project.name}`}
+                      onClick={() => void deleteProject(project)}><Trash2 size={16}/></button>
+                  </div>
                 </article>
               ))}
-              {projects.length === 0 && <button className="create-card" onClick={() => setShowCreate(true)}><PackagePlus size={30}/><strong>Buat project Android</strong><span>Kotlin atau Java, XML Views</span></button>}
-            </div>
+              {projects.length === 0 && <button className="create-card" onClick={() => setShowCreate(true)}><PackagePlus size={30}/><strong>Buat proyek baru</strong><span>Aplikasi Android atau pustaka Java</span></button>}
+              </div>
+            )}
           </div>
         )}
       </main>
 
+      {appDialog && (
+        <div className="modal-backdrop app-dialog-backdrop" onMouseDown={event => {
+          if (event.target === event.currentTarget) closeAppDialog(null)
+        }}>
+          <section
+            className="modal app-dialog"
+            role={appDialog.kind === 'confirm' ? 'alertdialog' : 'dialog'}
+            aria-modal="true"
+            aria-labelledby="app-dialog-title"
+            onKeyDown={event => {
+              if (event.key === 'Escape') {
+                event.preventDefault()
+                closeAppDialog(null)
+              }
+            }}
+          >
+            <div className="modal-head">
+              <div><small>{appDialog.kind === 'confirm' ? 'KONFIRMASI' : appDialog.kind === 'prompt' ? 'INPUT' : 'INFO'}</small>
+                <h2 id="app-dialog-title">{appDialog.title}</h2>
+              </div>
+              <button className="icon-btn" type="button" aria-label="Tutup" onClick={() => closeAppDialog(null)}><X size={18}/></button>
+            </div>
+            <form onSubmit={event => {
+              event.preventDefault()
+              closeAppDialog(appDialog.kind === 'prompt' ? dialogInput : true)
+            }}>
+              <p>{appDialog.message}</p>
+              {appDialog.kind === 'prompt' && (
+                <input
+                  className="app-dialog-input"
+                  autoFocus
+                  value={dialogInput}
+                  placeholder={appDialog.placeholder}
+                  onChange={event => setDialogInput(event.target.value)}
+                />
+              )}
+              <div className="app-dialog-actions">
+                {appDialog.kind !== 'alert' && <button className="tool-btn" type="button" onClick={() => closeAppDialog(null)}>
+                  {appDialog.cancelLabel ?? 'Batal'}
+                </button>}
+                <button className={`primary-btn app-dialog-confirm${appDialog.destructive ? ' destructive' : ''}`}
+                  type="submit" autoFocus={appDialog.kind !== 'prompt'}>
+                  {appDialog.confirmLabel ?? (appDialog.kind === 'confirm' ? 'Lanjutkan' : 'Oke')}
+                </button>
+              </div>
+            </form>
+          </section>
+        </div>
+      )}
       {showCreate && <CreateProjectModal onClose={() => setShowCreate(false)} onCreate={createProject}/>}
-      {buildOptionsOpen && <BuildOptionsDialog
+      {buildOptionsOpen && activeProject && <BuildOptionsDialog
+        projectType={projectTypeOf(activeProject)}
         onClose={() => setBuildOptionsOpen(false)}
         onStart={options => void startBuild(options)}
       />}
       {buildOpen && (
         <div className="build-sheet">
           <div className="build-head">
-            <div><small>BUILD STATUS</small><strong>{buildStatus === 'idle' ? `${buildVariant} APK` : `${buildVariant} · ${buildStatus}`}</strong></div>
+            <div><small>STATUS BUILD</small><strong>{buildStatus === 'idle' ? `${buildVariant} ${buildArtifactLabel(buildVariant)}` : `${buildVariant} · ${buildStatusLabel(buildStatus)}`}</strong></div>
             <div className="build-head-actions">
               {(buildStatus === 'preparing' || buildStatus === 'assembling' || buildStatus === 'queued' || buildStatus === 'building') &&
                 <button className="icon-btn cancel-build-btn" title={buildCanceling ? 'Membatalkan build' : 'Batalkan build'}
@@ -1395,12 +1778,27 @@ function App() {
           {buildHistory.length > 1 && <div className="build-history"><label>Riwayat build<select value={buildId ?? ''} onChange={event => {
             const build = buildHistory.find(item => item.id === event.target.value)
             if (build) followBuild(build)
-          }}>{buildHistory.map(build => <option key={build.id} value={build.id}>{build.variant} · {build.status} · {new Date(build.createdAt).toLocaleString()}</option>)}</select></label></div>}
-          <div className={`status-line ${buildStatus}`}><span></span>{buildStatus === 'preparing' ? 'Menyiapkan manifest dan binary...' : buildStatus === 'assembling' ? 'Merakit workspace...' : buildStatus === 'building' ? 'Building...' : buildStatus === 'success' ? 'Build berhasil' : buildStatus === 'failed' ? 'Build gagal' : buildStatus === 'canceled' ? 'Build dibatalkan' : 'Menunggu worker'}</div>
+          }}>{buildHistory.map(build => <option key={build.id} value={build.id}>{build.variant} · {buildStatusLabel(build.status)} · {new Date(build.createdAt).toLocaleString()}</option>)}</select></label></div>}
+          <div className={`status-line ${buildStatus}`}><span></span>{buildStatus === 'preparing' ? 'Menyiapkan manifest dan berkas biner…' : buildStatus === 'assembling' ? 'Menyusun ruang kerja…' : buildStatus === 'building' ? 'Sedang membangun…' : buildStatus === 'success' ? 'Build berhasil' : buildStatus === 'failed' ? 'Build gagal' : buildStatus === 'canceled' ? 'Build dibatalkan' : 'Menunggu proses build'}</div>
+          {authMode === 'private' && <BuildResourcePanel metrics={buildMetrics} history={buildMetricsHistory}/>}
           <div className="log-view">{logs.map((line, i) => <div key={i}><span>{String(i + 1).padStart(3, '0')}</span>{line}</div>)}</div>
+          <button className="tool-btn full-log-btn" onClick={() => setFullLogOpen(true)}><FileText size={16}/><span>Log lengkap</span></button>
           {buildStatus === 'success' && buildId && buildHistory.find(build => build.id === buildId)?.artifact &&
-            <a className="download-btn" href={`/api/builds/${buildId}/artifact`} download><Download size={17}/>Download APK</a>}
+            <a className="download-btn" href={`/api/builds/${buildId}/artifact`} download><Download size={17}/>Unduh {buildArtifactLabel(buildHistory.find(build => build.id === buildId)?.variant ?? buildVariant)}</a>}
         </div>
+      )}
+      {fullLogOpen && buildId && (
+        <BuildLogScreen
+          buildId={buildId}
+          authMode={authMode}
+          variant={buildVariant}
+          status={buildStatus}
+          logs={logs}
+          metrics={authMode === 'private' ? buildMetrics : null}
+          history={buildMetricsHistory}
+          onBack={() => { setFullLogOpen(false); setBuildOpen(true) }}
+          onCopy={copyLogs}
+        />
       )}
       {storageOpen && (
         <StorageDialog
@@ -1441,11 +1839,178 @@ function App() {
   )
 }
 
-function BuildOptionsDialog({ onStart, onClose }: {
+function AnimatedBuildStatus({ variant }: { variant: Build['variant'] }) {
+  const [dots, setDots] = useState(0)
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setDots(current => (current + 1) % 4), 450)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  return <small className="project-build-status">Membangun<span>{'.'.repeat(dots)}</span> • {variant}</small>
+}
+
+function MetricSparkline({ values, label, color }: { values: number[]; label: string; color: string }) {
+  const max = Math.max(100, ...values)
+  const points = values.map((value, index) => {
+    const x = values.length < 2 ? 0 : (index / (values.length - 1)) * 180
+    const y = 30 - Math.min(100, value / max * 100) * 0.28
+    return `${x},${y}`
+  }).join(' ')
+  return (
+    <svg className="metric-sparkline" viewBox="0 0 180 34" role="img" aria-label={`${label}, 60 sampel terakhir`}>
+      <polyline points={points} fill="none" stroke={color} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round"/>
+    </svg>
+  )
+}
+
+function ResourceTile({ title, value, detail, percent, history, color }: {
+  title: string
+  value: string
+  detail: string
+  percent: number
+  history: number[]
+  color: string
+}) {
+  const normalized = Math.min(100, Math.max(0, percent))
+  return (
+    <article className="resource-tile">
+      <div className="resource-tile-head"><span>{title}</span><strong>{percent.toFixed(1)}%</strong></div>
+      <strong className="resource-value">{value}</strong>
+      <span className="resource-detail">{detail}</span>
+      <div className="resource-meter"><span style={{ width: `${normalized}%`, background: color }}/></div>
+      <MetricSparkline values={history} label={title} color={color}/>
+    </article>
+  )
+}
+
+function MonitorDashboard({ metrics, history, error, builds, projects, onOpenBuild }: {
+  metrics: HostResourceMetrics | null
+  history: MetricHistoryPoint[]
+  error: string
+  builds: Build[]
+  projects: Project[]
+  onOpenBuild: (build: Build) => void
+}) {
+  const projectNames = new Map(projects.map(project => [project.id, project.name]))
+  const cpuHistory = history.map(point => point.cpu)
+  const memoryHistory = history.map(point => point.memory)
+  return (
+    <section className="monitor-dashboard">
+      <div className="monitor-dashboard-title">
+        <div><small>PEMANTAUAN SERVER · MODE PRIVAT</small><h2><Server size={20}/>Sumber daya server</h2></div>
+        <span className="monitor-live"><i/>Langsung · 2 detik</span>
+      </div>
+      {error && <div className="monitor-error">{error}</div>}
+      <div className="resource-grid">
+        <ResourceTile
+          title="Penggunaan CPU server"
+          value={metrics ? `${metrics.cpuPercent.toFixed(1)}%` : '—'}
+          detail={metrics ? `Diperbarui ${new Date(metrics.sampledAt).toLocaleTimeString()}` : 'Menunggu data server'}
+          percent={metrics?.cpuPercent ?? 0}
+          history={cpuHistory}
+          color="#65b7ff"
+        />
+        <ResourceTile
+          title="Penggunaan RAM server"
+          value={metrics ? `${formatBytes(metrics.memoryUsedBytes)} / ${formatBytes(metrics.memoryTotalBytes)}` : '—'}
+          detail={metrics ? `${formatBytes(metrics.memoryAvailableBytes)} tersedia` : 'Menunggu data server'}
+          percent={metrics?.memoryPercent ?? 0}
+          history={memoryHistory}
+          color="#45d6a4"
+        />
+      </div>
+      <div className="monitor-api-note">
+        <strong><Activity size={15}/> Endpoint server privat</strong>
+        <code>GET {window.location.origin}/api/monitor/host</code>
+        <code>curl -H 'X-API-Key: $IDE_API_KEY' '{window.location.origin}/api/monitor/host'</code>
+      </div>
+      <div className="monitor-builds-head"><h3>Build aktif</h3><span>{builds.length}</span></div>
+      {builds.length === 0 ? <div className="monitor-build-empty">Tidak ada build yang sedang berjalan.</div> : (
+        <div className="monitor-build-list">
+          {builds.map(build => (
+            <article className="monitor-build-row" key={build.id}>
+              <div className="monitor-build-details">
+                <strong>{projectNames.get(build.projectId) ?? build.projectId}</strong>
+                <span>{build.variant} · {buildStatusLabel(build.status)} · {build.id}</span>
+              </div>
+              <button className="tool-btn monitor-open-log" onClick={() => onOpenBuild(build)}>
+                <FileText size={15}/><span>Log lengkap</span>
+              </button>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  )
+}
+
+function BuildResourcePanel({ metrics, history }: {
+  metrics: BuildResourceMetrics | null
+  history: MetricHistoryPoint[]
+}) {
+  return (
+    <section className="build-resource-panel">
+      <div className="build-resource-heading"><Activity size={15}/><strong>Sumber daya proses build</strong>
+        <span>{metrics ? `Puncak CPU ${metrics.peakCpuPercent.toFixed(1)}%` : 'Menunggu proses build'}</span>
+      </div>
+      {metrics ? (
+        <div className="build-resource-values">
+          <div><span>cpu</span><strong>{metrics.cpuPercent.toFixed(1)}%</strong><MetricSparkline values={history.map(point => point.cpu)} label="cpu build" color="#65b7ff"/></div>
+          <div><span>ram</span><strong>{formatBytes(metrics.memoryUsedBytes)} / {formatBytes(metrics.memoryLimitBytes)}</strong>
+            <small>{metrics.memoryPercent.toFixed(1)}% · peak {formatBytes(metrics.peakMemoryUsedBytes)}</small>
+            <MetricSparkline values={history.map(point => point.memory)} label="ram build" color="#45d6a4"/>
+          </div>
+        </div>
+      ) : <p>Data CPU dan RAM tersedia saat proses build berjalan.</p>}
+    </section>
+  )
+}
+
+function BuildLogScreen({ buildId, authMode, variant, status, logs, metrics, history, onBack, onCopy }: {
+  buildId: string
+  authMode: AuthStatus['mode']
+  variant: BuildVariant
+  status: Build['status'] | 'idle'
+  logs: string[]
+  metrics: BuildResourceMetrics | null
+  history: MetricHistoryPoint[]
+  onBack: () => void
+  onCopy: () => void
+}) {
+  const apiURL = `${window.location.origin}/api/monitor/builds/${encodeURIComponent(buildId)}`
+  return (
+    <section className="build-log-screen">
+      <header className="build-log-screen-head">
+        <button className="exit-project-btn" onClick={onBack}><ArrowLeft size={17}/><span>Kembali ke proyek</span></button>
+        <div className="build-log-title"><small>LOG BUILD · {buildId}</small><strong>{variant} {buildArtifactLabel(variant)} · {status === 'idle' ? 'Belum dimulai' : buildStatusLabel(status)}</strong></div>
+        <button className="tool-btn build-log-copy" onClick={onCopy} disabled={logs.length === 0}><Copy size={16}/><span>Salin log</span></button>
+      </header>
+      {authMode === 'private' && <BuildResourcePanel metrics={metrics} history={history}/>}
+      <div className="build-log-api">
+        <span>Pemantauan API</span>
+        <code>GET {apiURL}</code>
+        <code>{authMode === 'private'
+          ? `curl -H 'X-API-Key: $IDE_API_KEY' '${apiURL}'`
+          : `curl '${apiURL}'`}</code>
+        {status !== 'building' && status !== 'queued' && status !== 'preparing' && status !== 'assembling' &&
+          <a className="download-btn" href={`/api/builds/${encodeURIComponent(buildId)}/artifact`} download>
+            <Download size={15}/>Unduh {buildArtifactLabel(variant)}
+          </a>}
+      </div>
+      <div className="log-view full-log-view" aria-live="polite">
+        {logs.map((line, index) => <div key={`${index}-${line}`}><span>{String(index + 1).padStart(4, '0')}</span>{line}</div>)}
+      </div>
+    </section>
+  )
+}
+
+function BuildOptionsDialog({ projectType, onStart, onClose }: {
+  projectType: ProjectType
   onStart: (options: BuildOptions) => void
   onClose: () => void
 }) {
-  const [variant, setVariant] = useState<Build['variant']>('debug')
+  const [variant, setVariant] = useState<BuildVariant>(projectType === 'java-library' ? 'jar' : 'debug')
   const [signRelease, setSignRelease] = useState(true)
   const [keystore, setKeystore] = useState<File | null>(null)
   const [keyAlias, setKeyAlias] = useState('')
@@ -1456,9 +2021,9 @@ function BuildOptionsDialog({ onStart, onClose }: {
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     setError('')
-    if (variant === 'release' && signRelease) {
+    if (projectType === 'android' && variant === 'release' && signRelease) {
       if (!keystore || !keyAlias.trim() || !storePassword || !keyPassword) {
-        setError('Pilih keystore dan isi alias serta kedua password')
+        setError('Pilih keystore, lalu isi alias dan kedua kata sandi.')
         return
       }
       onStart({ variant, keystore, keyAlias: keyAlias.trim(), storePassword, keyPassword })
@@ -1471,17 +2036,22 @@ function BuildOptionsDialog({ onStart, onClose }: {
     <div className="modal-backdrop">
       <section className="modal build-options-modal">
         <div className="modal-head">
-          <div><small>BUILD APK</small><h2>Pengaturan build</h2></div>
+          <div><small>{projectType === 'android' ? 'BUILD APK' : 'BUILD JAR'}</small><h2>Pengaturan build</h2></div>
           <button className="icon-btn" title="Tutup" onClick={onClose}><X size={18}/></button>
         </div>
         <form onSubmit={submit}>
-          <label>Variant
-            <select value={variant} onChange={event => setVariant(event.target.value as Build['variant'])}>
-              <option value="debug">Debug · untuk testing</option>
-              <option value="release">Release · untuk distribusi</option>
+          <label>Varian
+            <select value={variant} onChange={event => setVariant(event.target.value as BuildVariant)}>
+              {projectType === 'android' ? <>
+                <option value="debug">Debug · untuk testing</option>
+                <option value="release">Release · untuk distribusi</option>
+              </> : <>
+                <option value="jar">JAR standar · dependency terpisah</option>
+                <option value="fat-jar">Fat JAR · dependency runtime disertakan</option>
+              </>}
             </select>
           </label>
-          {variant === 'release' && (
+          {projectType === 'android' && variant === 'release' && (
             <>
               <label className="build-sign-toggle">
                 <input type="checkbox" checked={signRelease} onChange={event => setSignRelease(event.target.checked)}/>
@@ -1489,7 +2059,7 @@ function BuildOptionsDialog({ onStart, onClose }: {
               </label>
               {signRelease ? (
                 <>
-                  <p className="build-signing-note">Keystore dan password hanya dipakai untuk build ini, lalu file keystore dihapus dari server.</p>
+                  <p className="build-signing-note">Keystore dan kata sandi hanya digunakan untuk build ini. Berkas keystore akan dihapus dari server setelahnya.</p>
                   <label>File keystore (.jks, .keystore, .p12)
                     <input type="file" accept=".jks,.keystore,.p12,.pfx" onChange={event => {
                       const file = event.currentTarget.files?.[0] ?? null
@@ -1503,19 +2073,21 @@ function BuildOptionsDialog({ onStart, onClose }: {
                       setKeystore(file)
                     }}/>
                   </label>
-                  <label>Key alias<input value={keyAlias} onChange={event => setKeyAlias(event.target.value)} autoComplete="off" required/></label>
+                  <label>Alias kunci<input value={keyAlias} onChange={event => setKeyAlias(event.target.value)} autoComplete="off" required/></label>
                   <div className="form-row">
-                    <label>Store password<input type="password" value={storePassword} onChange={event => setStorePassword(event.target.value)} autoComplete="new-password" required/></label>
-                    <label>Key password<input type="password" value={keyPassword} onChange={event => setKeyPassword(event.target.value)} autoComplete="new-password" required/></label>
+                    <label>Kata sandi keystore<input type="password" value={storePassword} onChange={event => setStorePassword(event.target.value)} autoComplete="new-password" required/></label>
+                    <label>Kata sandi kunci<input type="password" value={keyPassword} onChange={event => setKeyPassword(event.target.value)} autoComplete="new-password" required/></label>
                   </div>
                 </>
               ) : (
-                <p className="build-signing-note unsigned">Release tanpa signature nggak bisa dipasang langsung di Android.</p>
+                <p className="build-signing-note unsigned">Build release tanpa tanda tangan tidak dapat langsung dipasang di Android.</p>
               )}
             </>
           )}
           {error && <div className="build-signing-error">{error}</div>}
-          <button className="primary-btn full" type="submit">Build {variant} APK</button>
+          <button className="primary-btn full" type="submit">
+            Build {variant === 'fat-jar' ? 'fat JAR' : variant === 'jar' ? 'JAR' : `${variant} APK`}
+          </button>
         </form>
       </section>
     </div>
@@ -1536,35 +2108,35 @@ function NotificationDialog({ settings, loading, saving, error, onSettingsChange
     <div className="modal-backdrop" onMouseDown={onClose}>
       <form className="modal notification-modal" onMouseDown={event => event.stopPropagation()} onSubmit={onSave}>
         <div className="modal-head">
-          <div><small>BUILD EMAIL</small><h2>Notifikasi email build</h2></div>
+          <div><small>NOTIFIKASI BUILD</small><h2>Notifikasi email build</h2></div>
           <button type="button" className="icon-btn" onClick={onClose}><X size={18}/></button>
         </div>
-        {loading ? <p className="notification-info">memuat pengaturan…</p> : settings && (
+        {loading ? <p className="notification-info">Memuat pengaturan…</p> : settings && (
           <>
             <div className={`notification-info ${settings.smtpConfigured ? 'configured' : 'not-configured'}`}>
               {settings.smtpConfigured
-                ? 'SMTP siap. Kredensial pengirim disimpan di data/IDE.config.'
-                : 'SMTP belum dikonfigurasi. Isi bagian smtp di data/IDE.config lalu restart service.'}
+                ? 'SMTP siap digunakan. Kredensial pengirim tersimpan di data/IDE.config.'
+                : 'SMTP belum dikonfigurasi. Lengkapi bagian smtp di data/IDE.config, lalu mulai ulang layanan.'}
             </div>
             <label>Email penerima
               <input type="email" autoComplete="email" maxLength={320} value={settings.recipient}
                 onChange={event => onSettingsChange({ ...settings, recipient: event.target.value })}
-                placeholder="lu@example.com"/>
+                placeholder="nama@example.com"/>
             </label>
             <div className="notification-options">
               <label><input type="checkbox" checked={settings.notifySuccess}
                 onChange={event => onSettingsChange({ ...settings, notifySuccess: event.target.checked })}/>
-                <span><strong>Build berhasil</strong><small>kirim notifikasi saat APK selesai dibuat</small></span></label>
+                <span><strong>Build berhasil</strong><small>Kirim notifikasi setelah APK selesai dibuat.</small></span></label>
               <label><input type="checkbox" checked={settings.notifyFailure}
                 onChange={event => onSettingsChange({ ...settings, notifyFailure: event.target.checked })}/>
-                <span><strong>Build gagal</strong><small>kirim notifikasi saat build gagal</small></span></label>
+                <span><strong>Build gagal</strong><small>Kirim notifikasi jika build gagal.</small></span></label>
             </div>
           </>
         )}
         {error && <div className="login-error">{error}</div>}
         <div className="notification-actions">
           <button type="submit" className="primary-btn" disabled={busy || !settings}>
-            {saving ? 'menyimpan…' : 'simpan'}
+            {saving ? 'Menyimpan…' : 'Simpan'}
           </button>
         </div>
       </form>
@@ -1586,13 +2158,13 @@ function LoginScreen({ loading, offline, error, password, busy, onPasswordChange
       <form className="login-card" onSubmit={onSubmit}>
         <div className="brand-mark"><Box size={20}/></div>
         <small>SELF-HOSTED ANDROID IDE</small>
-        <h1>{loading ? 'menghubungkan…' : 'private workspace'}</h1>
-        <p>{offline ? 'login perlu koneksi. akses offline tersedia setelah lu pernah login di browser ini.' : 'masukin password buat lanjut ke workspace.'}</p>
-        <label>password<input type="password" autoComplete="current-password" value={password}
+        <h1>{loading ? 'Menghubungkan…' : 'Ruang kerja privat'}</h1>
+        <p>{offline ? 'Login memerlukan koneksi. Akses offline tersedia setelah Anda masuk melalui peramban ini.' : 'Masukkan kata sandi untuk melanjutkan ke ruang kerja.'}</p>
+        <label>Kata sandi<input type="password" autoComplete="current-password" value={password}
           onChange={event => onPasswordChange(event.target.value)} autoFocus disabled={loading || offline} required/></label>
         {error && <div className="login-error">{error}</div>}
         <button className="primary-btn full" type="submit" disabled={busy || loading || offline || !password}>
-          {busy ? 'memeriksa…' : 'masuk'}
+          {busy ? 'Memeriksa…' : 'Masuk'}
         </button>
       </form>
     </main>
@@ -1612,26 +2184,26 @@ function StorageDialog({ stats, loading, options, onOptionChange, onRefresh, onC
     <div className="modal-backdrop" onMouseDown={onClose}>
       <div className="modal storage-modal" onMouseDown={event => event.stopPropagation()}>
         <div className="modal-head">
-          <div><small>SERVER STORAGE</small><h2>Build cache &amp; data</h2></div>
+          <div><small>PENYIMPANAN SERVER</small><h2>Cache dan data build</h2></div>
           <button className="icon-btn" onClick={onClose}><X size={18}/></button>
         </div>
         <div className="storage-stats">
-          <div><span>Build workspaces</span><strong>{stats ? formatBytes(stats.workspaceBytes) : '—'}</strong></div>
-          <div><span>APK artifacts</span><strong>{stats ? formatBytes(stats.artifactBytes) : '—'}</strong></div>
-          <div><span>Binary asset cache</span><strong>{stats ? formatBytes(stats.blobBytes) : '—'}</strong></div>
-          <div><span>Gradle cache · Docker volume</span><strong>{stats ? formatBytes(stats.gradleCacheBytes) : '—'}</strong></div>
-          <div><span>Database · {stats?.buildHistory ?? 0} build records</span><strong>{stats ? formatBytes(stats.databaseBytes) : '—'}</strong></div>
+          <div><span>Ruang kerja build</span><strong>{stats ? formatBytes(stats.workspaceBytes) : '—'}</strong></div>
+          <div><span>Hasil build</span><strong>{stats ? formatBytes(stats.artifactBytes) : '—'}</strong></div>
+          <div><span>Cache berkas biner</span><strong>{stats ? formatBytes(stats.blobBytes) : '—'}</strong></div>
+          <div><span>Cache Gradle · volume Docker</span><strong>{stats ? formatBytes(stats.gradleCacheBytes) : '—'}</strong></div>
+          <div><span>Basis data · {stats?.buildHistory ?? 0} riwayat build</span><strong>{stats ? formatBytes(stats.databaseBytes) : '—'}</strong></div>
         </div>
-        <p className="storage-paths">lokasi: <code>DATA_DIR/workspaces</code>, <code>DATA_DIR/artifacts</code>, dan volume <code>androidide_gradle</code>. project di IndexedDB browser tidak ikut dihapus.</p>
+        <p className="storage-paths">Lokasi: <code>DATA_DIR/workspaces</code>, <code>DATA_DIR/artifacts</code>, dan volume <code>androidide_gradle</code>. Proyek di IndexedDB peramban tidak ikut dihapus.</p>
         <div className="cleanup-options">
-          <label><input type="checkbox" checked={options.workspaces} onChange={event => onOptionChange('workspaces', event.target.checked)}/><span><strong>workspace lama</strong><small>hapus source ZIP dan output build yang tertinggal</small></span></label>
-          <label><input type="checkbox" checked={options.artifacts} onChange={event => onOptionChange('artifacts', event.target.checked)}/><span><strong>APK artifacts</strong><small>APK terhapus dan tidak bisa didownload lagi</small></span></label>
-          <label><input type="checkbox" checked={options.history} onChange={event => onOptionChange('history', event.target.checked)}/><span><strong>riwayat dan log build</strong><small>melepas binary cache terkait lalu menjalankan garbage collection</small></span></label>
-          <label><input type="checkbox" checked={options.gradleCache} onChange={event => onOptionChange('gradleCache', event.target.checked)}/><span><strong>Gradle dependency cache</strong><small>build berikutnya perlu download dependency lagi</small></span></label>
+          <label><input type="checkbox" checked={options.workspaces} onChange={event => onOptionChange('workspaces', event.target.checked)}/><span><strong>Ruang kerja lama</strong><small>Hapus arsip ZIP sumber dan keluaran build yang tersisa.</small></span></label>
+          <label><input type="checkbox" checked={options.artifacts} onChange={event => onOptionChange('artifacts', event.target.checked)}/><span><strong>Hasil build</strong><small>Hasil build yang dihapus tidak dapat diunduh kembali.</small></span></label>
+          <label><input type="checkbox" checked={options.history} onChange={event => onOptionChange('history', event.target.checked)}/><span><strong>Riwayat dan log build</strong><small>Hapus referensi cache biner terkait dan jalankan pembersihan cache.</small></span></label>
+          <label><input type="checkbox" checked={options.gradleCache} onChange={event => onOptionChange('gradleCache', event.target.checked)}/><span><strong>Cache dependensi Gradle</strong><small>Build berikutnya akan mengunduh ulang dependensi.</small></span></label>
         </div>
         <div className="storage-actions">
-          <button className="tool-btn refresh-storage" onClick={onRefresh} disabled={loading}>{loading ? 'memuat…' : 'refresh ukuran'}</button>
-          <button className="danger-btn" onClick={onCleanup} disabled={loading}>{loading ? 'membersihkan…' : 'bersihkan yang dipilih'}</button>
+          <button className="tool-btn refresh-storage" onClick={onRefresh} disabled={loading}>{loading ? 'Memuat…' : 'Perbarui ukuran'}</button>
+          <button className="danger-btn" onClick={onCleanup} disabled={loading}>{loading ? 'Membersihkan…' : 'Hapus pilihan'}</button>
         </div>
       </div>
     </div>
@@ -1639,17 +2211,17 @@ function StorageDialog({ stats, loading, options, onOptionChange, onRefresh, onC
 }
 
 function ArtifactDialog({ artifacts, projects, loading, deletingId, error, onRefresh, onDelete, onClose }: {
-  artifacts: APKArtifact[]
+  artifacts: BuildArtifact[]
   projects: Project[]
   loading: boolean
   deletingId: string | null
   error: string
   onRefresh: () => void
-  onDelete: (artifact: APKArtifact) => void
+  onDelete: (artifact: BuildArtifact) => void
   onClose: () => void
 }) {
   const projectNames = new Map(projects.map(project => [project.id, project.name]))
-  const grouped = new Map<string, APKArtifact[]>()
+  const grouped = new Map<string, BuildArtifact[]>()
   for (const artifact of artifacts) {
     const items = grouped.get(artifact.projectId) ?? []
     items.push(artifact)
@@ -1660,7 +2232,7 @@ function ArtifactDialog({ artifacts, projects, loading, deletingId, error, onRef
     <div className="modal-backdrop" onMouseDown={onClose}>
       <div className="modal artifact-modal" onMouseDown={event => event.stopPropagation()}>
         <div className="modal-head">
-          <div><small>BUILD ARTIFACTS</small><h2>APK tersimpan</h2></div>
+          <div><small>ARSIP BUILD</small><h2>Hasil build tersimpan</h2></div>
           <div className="artifact-head-actions">
             <button className="icon-btn" title="Muat ulang" aria-label="Muat ulang" onClick={onRefresh} disabled={loading}>
               <RefreshCw size={16}/>
@@ -1669,34 +2241,34 @@ function ArtifactDialog({ artifacts, projects, loading, deletingId, error, onRef
           </div>
         </div>
         <div className="artifact-summary">
-          {loading ? 'memuat daftar APK…' : `${artifacts.length} APK di ${grouped.size} project`}
+          {loading ? 'Memuat daftar hasil build…' : `${artifacts.length} hasil build dalam ${grouped.size} proyek`}
         </div>
         {error && <div className="login-error">{error}</div>}
         {!loading && artifacts.length === 0 && !error && (
-          <div className="artifact-empty">belum ada APK hasil build</div>
+          <div className="artifact-empty">Belum ada hasil build.</div>
         )}
         <div className="artifact-groups">
           {[...grouped.entries()].map(([projectId, items]) => (
             <section className="artifact-group" key={projectId}>
               <div className="artifact-project">
                 <strong>{projectNames.get(projectId) ?? projectId}</strong>
-                <span>{items.length} APK</span>
+                <span>{items.length} hasil build</span>
               </div>
               {items.map(artifact => (
                 <div className="artifact-row" key={artifact.buildId}>
                   <div className="artifact-info">
                     <strong>{artifact.filename}</strong>
                     <span>{artifact.variant} · {new Date(artifact.createdAt).toLocaleString()} · {formatBytes(artifact.size)}</span>
-                    {!artifact.available && <small className="artifact-missing">file APK tidak tersedia di server</small>}
+                    {!artifact.available && <small className="artifact-missing">Berkas hasil build tidak tersedia di server.</small>}
                   </div>
                   <div className="artifact-actions">
                     {artifact.available
-                      ? <a className="icon-btn" title="Download APK" aria-label="Download APK"
+                      ? <a className="icon-btn" title={`Unduh ${artifact.projectType === 'java-library' ? 'JAR' : 'APK'}`} aria-label={`Unduh ${artifact.projectType === 'java-library' ? 'JAR' : 'APK'}`}
                           href={`/api/builds/${encodeURIComponent(artifact.buildId)}/artifact`} download>
                           <Download size={16}/>
                         </a>
-                      : <button className="icon-btn" title="APK tidak tersedia" aria-label="APK tidak tersedia" disabled><Download size={16}/></button>}
-                    <button className="icon-btn artifact-delete" title="Hapus APK" aria-label="Hapus APK"
+                      : <button className="icon-btn" title="Hasil build tidak tersedia" aria-label="Hasil build tidak tersedia" disabled><Download size={16}/></button>}
+                    <button className="icon-btn artifact-delete" title="Hapus hasil build" aria-label="Hapus hasil build"
                       onClick={() => onDelete(artifact)} disabled={deletingId !== null}>
                       <Trash2 size={16}/>
                     </button>
@@ -1715,21 +2287,27 @@ function CreateProjectModal({ onClose, onCreate }: {
   onClose: () => void
   onCreate: (project: Omit<Project, 'id' | 'createdAt' | 'updatedAt' | 'templateId'>) => void
 }) {
-  const [name, setName] = useState('My App')
+  const [name, setName] = useState('Aplikasi Saya')
   const [packageName, setPackageName] = useState('com.example.myapp')
+  const [projectType, setProjectType] = useState<ProjectType>('android')
   const [language, setLanguage] = useState<'kotlin' | 'java'>('kotlin')
   const [minSdk, setMinSdk] = useState(24)
   const [targetSdk, setTargetSdk] = useState(34)
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <div className="modal" onMouseDown={e => e.stopPropagation()}>
-        <div className="modal-head"><div><small>NEW PROJECT</small><h2>Empty App</h2></div><button className="icon-btn" onClick={onClose}><X size={18}/></button></div>
-        <label>App name<input value={name} onChange={e => setName(e.target.value)}/></label>
-        <label>Package name<input value={packageName} onChange={e => setPackageName(e.target.value)} placeholder="com.example.myapp"/></label>
-        <div className="form-row"><label>Language<select value={language} onChange={e => setLanguage(e.target.value as 'kotlin' | 'java')}><option value="kotlin">Kotlin</option><option value="java">Java</option></select></label><label>Template<select><option>Empty App</option></select></label></div>
-        <div className="form-row"><label>Min SDK<input type="number" value={minSdk} onChange={e => setMinSdk(Number(e.target.value))}/></label><label>Target SDK<input type="number" value={targetSdk} onChange={e => setTargetSdk(Number(e.target.value))}/></label></div>
+        <div className="modal-head"><div><small>PROYEK BARU</small><h2>{projectType === 'android' ? 'Aplikasi Android' : 'Pustaka Java'}</h2></div><button className="icon-btn" onClick={onClose}><X size={18}/></button></div>
+        <label>Jenis proyek<select value={projectType} onChange={e => setProjectType(e.target.value as ProjectType)}>
+          <option value="android">Aplikasi Android</option><option value="java-library">Pustaka Java (.jar)</option>
+        </select></label>
+        <label>Nama proyek<input value={name} onChange={e => setName(e.target.value)}/></label>
+        <label>{projectType === 'android' ? 'Nama paket' : 'Paket / grup Java'}<input value={packageName} onChange={e => setPackageName(e.target.value)} placeholder="com.example.myapp"/></label>
+        {projectType === 'android' && <>
+          <div className="form-row"><label>Bahasa<select value={language} onChange={e => setLanguage(e.target.value as 'kotlin' | 'java')}><option value="kotlin">Kotlin</option><option value="java">Java</option></select></label><label>Templat<select><option>Aplikasi kosong</option></select></label></div>
+          <div className="form-row"><label>Min SDK<input type="number" value={minSdk} onChange={e => setMinSdk(Number(e.target.value))}/></label><label>Target SDK<input type="number" value={targetSdk} onChange={e => setTargetSdk(Number(e.target.value))}/></label></div>
+        </>}
         <button className="primary-btn full" disabled={!name.trim() || !/^([a-zA-Z_]\w*\.)+[a-zA-Z_]\w*$/.test(packageName)}
-          onClick={() => onCreate({ name: name.trim(), packageName: packageName.trim(), language, minSdk, targetSdk })}>Buat project</button>
+          onClick={() => onCreate({ name: name.trim(), packageName: packageName.trim(), language: projectType === 'java-library' ? 'java' : language, projectType, minSdk, targetSdk })}>Buat proyek</button>
       </div>
     </div>
   )
