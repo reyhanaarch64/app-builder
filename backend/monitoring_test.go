@@ -139,6 +139,84 @@ func TestPublicBuildMonitorIsIDScopedAndOmitsResourceMetrics(t *testing.T) {
 	}
 }
 
+func TestBuildLogMonitorStreamsLogsWithAPIKeyAndNoStatusPayload(t *testing.T) {
+	db := testDB(t)
+	buildID := "bld_1234567890abcdef1234567890abcdef"
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := db.Exec(`INSERT INTO builds(id,project_id,owner_id,status,variant,created_at,finished_at,access_mode)
+		VALUES(?, 'project-a', 'owner-a', 'success', 'debug', ?, ?, 'private')`, buildID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO build_logs(build_id,sequence,stream,message,created_at)
+		VALUES(?,1,'stdout','Gradle task started',?),(?,2,'stderr','Compiler warning',?)`,
+		buildID, now, buildID, now); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{
+		db: db, config: AppConfig{Mode: "private", Password: "monitor-secret"},
+		sessions: map[string]session{},
+	}
+	handler := server.authMiddleware(http.HandlerFunc(server.handleBuildMonitor))
+	request := httptest.NewRequest(http.MethodGet, "/api/monitor/builds/"+buildID+"/logs", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated log monitor returned %d, want unauthorized", response.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/api/monitor/builds/"+buildID+"/logs", nil)
+	request.Header.Set("X-API-Key", "monitor-secret")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	body := response.Body.String()
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("log stream returned %d with content type %q: %s",
+			response.Code, response.Header().Get("Content-Type"), body)
+	}
+	if !strings.Contains(body, "data: Gradle task started\n\n") ||
+		!strings.Contains(body, "data: [stderr] Compiler warning\n\n") {
+		t.Fatalf("stream is missing build log lines: %s", body)
+	}
+	if strings.Contains(body, "event: end") || strings.Contains(body, "data: success") {
+		t.Fatalf("log-only stream exposed build status: %s", body)
+	}
+}
+
+func TestPublicBuildLogMonitorOnlyStreamsPublicBuilds(t *testing.T) {
+	db := testDB(t)
+	now := time.Now().UTC().Format(time.RFC3339)
+	publicID := "bld_abcdef0123456789abcdef0123456789"
+	privateID := "bld_0123456789abcdef0123456789abcdef"
+	for _, build := range []struct {
+		id         string
+		accessMode string
+	}{
+		{id: publicID, accessMode: "public"},
+		{id: privateID, accessMode: "private"},
+	} {
+		if _, err := db.Exec(`INSERT INTO builds(id,project_id,owner_id,status,variant,created_at,finished_at,access_mode)
+			VALUES(?, 'project', 'owner', 'success', 'debug', ?, ?, ?)`,
+			build.id, now, now, build.accessMode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := &Server{db: db, config: AppConfig{Mode: "public"}}
+	handler := server.authMiddleware(http.HandlerFunc(server.handleBuildMonitor))
+	request := httptest.NewRequest(http.MethodGet, "/api/monitor/builds/"+publicID+"/logs", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("public build log stream returned %d: %s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/api/monitor/builds/"+privateID+"/logs", nil)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("public monitor exposed private build logs with status %d", response.Code)
+	}
+}
+
 func TestHostMonitorIsPrivateAndRequiresAuthentication(t *testing.T) {
 	server := &Server{
 		config:        AppConfig{Mode: "private", Password: "secret"},

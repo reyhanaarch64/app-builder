@@ -136,6 +136,17 @@ Release builds can be signed by uploading a JKS/PKCS12 keystore and entering its
 
 Each browser project has a stable ID. A second build for that project is rejected while its first build is queued or running; builds are also serialized globally. Once a build reaches a terminal state, that project can be built again.
 
+## Stream build logs
+
+The full build log screen shows a copyable Server-Sent Events URL for monitoring a build outside the web interface. Use `curl -N` to disable output buffering and print log lines as they arrive:
+
+```bash
+curl -N -H "X-API-Key: $IDE_API_KEY" \
+  "https://your-server.example/api/monitor/builds/<build-id>/logs"
+```
+
+In private mode, `X-API-Key` must match the configured login password. In public mode, the endpoint is available only for a public build when its ID is known. The stream replays existing log lines, continues with new lines, and closes when the build ends; it does not include build status or resource metrics.
+
 ## Storage and cleanup
 
 - Private builds use a temporary `DATA_DIR/workspaces/<build-id>` while building, then retain successful APKs, history, and binary cache until manually deleted.

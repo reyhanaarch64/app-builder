@@ -89,6 +89,11 @@ func (s *Server) handleBuildMonitor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	buildID := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/monitor/builds/"), "/")
+	if strings.HasSuffix(buildID, "/logs") {
+		buildID = strings.TrimSuffix(buildID, "/logs")
+		s.handleBuildLogStream(w, r, buildID)
+		return
+	}
 	if !validBuildID(buildID) || strings.Contains(buildID, "/") {
 		http.NotFound(w, r)
 		return
@@ -128,6 +133,103 @@ func (s *Server) handleBuildMonitor(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) handleBuildLogStream(w http.ResponseWriter, r *http.Request, buildID string) {
+	if !validBuildID(buildID) || strings.Contains(buildID, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	if s.config.Mode != "public" && !s.monitorAuthorized(r) {
+		http.Error(w, "Kunci API atau sesi tidak valid.", http.StatusUnauthorized)
+		return
+	}
+	var accessMode string
+	err := s.db.QueryRow(`SELECT access_mode FROM builds WHERE id=?`, buildID).Scan(&accessMode)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, "Gagal membaca informasi build.", http.StatusInternalServerError)
+		return
+	}
+	if (s.config.Mode == "public" && accessMode != "public") ||
+		(s.config.Mode != "public" && accessMode != "private") {
+		http.NotFound(w, r)
+		return
+	}
+	if err := s.touchPublicBuild(buildID); err != nil {
+		http.Error(w, "Gagal memperbarui aktivitas build.", http.StatusInternalServerError)
+		return
+	}
+	s.streamMonitorLogs(w, r, buildID)
+}
+
+func (s *Server) streamMonitorLogs(w http.ResponseWriter, r *http.Request, buildID string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Server tidak mendukung Server-Sent Events.", http.StatusInternalServerError)
+		return
+	}
+	flusher.Flush()
+	last := 0
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+	for {
+		rows, err := s.db.Query(`SELECT sequence,stream,message FROM build_logs WHERE build_id=? AND sequence>? ORDER BY sequence`, buildID, last)
+		if err != nil {
+			log.Printf("failed to read build logs for monitor stream %s: %v", buildID, err)
+			return
+		}
+		for rows.Next() {
+			var sequence int
+			var stream, message string
+			if err := rows.Scan(&sequence, &stream, &message); err != nil {
+				rows.Close()
+				log.Printf("failed to scan build log for monitor stream %s: %v", buildID, err)
+				return
+			}
+			if stream != "" && stream != "stdout" {
+				message = "[" + stream + "] " + message
+			}
+			message = strings.ReplaceAll(strings.ReplaceAll(message, "\r\n", "\n"), "\r", "\n")
+			fmt.Fprintf(w, "id: %d\n", sequence)
+			for _, line := range strings.Split(message, "\n") {
+				fmt.Fprintf(w, "data: %s\n", line)
+			}
+			fmt.Fprint(w, "\n")
+			flusher.Flush()
+			last = sequence
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			log.Printf("failed to iterate build logs for monitor stream %s: %v", buildID, err)
+			return
+		}
+		rows.Close()
+		build, err := s.getBuild(buildID)
+		if err != nil {
+			log.Printf("failed to read build status for monitor stream %s: %v", buildID, err)
+			return
+		}
+		if build.Status == "success" || build.Status == "failed" || build.Status == "canceled" {
+			return
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": keepalive\n\n")
+			flusher.Flush()
+		}
+	}
 }
 
 func (s *Server) runHostMetricsSampler() {

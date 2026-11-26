@@ -14,6 +14,7 @@ type ProjectType = 'android' | 'java-library'
 type BuildVariant = 'debug' | 'release' | 'jar' | 'fat-jar'
 
 type Project = {
+  iconResource?: string
   id: string
   name: string
   projectType?: ProjectType
@@ -165,6 +166,227 @@ function projectTypeOf(project: Project): ProjectType {
   return project.projectType ?? 'android'
 }
 
+function manifestIconResource(manifest: string | undefined): string | undefined {
+  const application = manifest?.match(/<application\b[^>]*>/i)?.[0]
+  if (!application) return undefined
+  const icon = application.match(/android:icon=["']@(mipmap|drawable)\/([^"']+)["']/i)
+  const roundIcon = application.match(/android:roundIcon=["']@(mipmap|drawable)\/([^"']+)["']/i)
+  const resource = icon ?? roundIcon
+  return resource ? `@${resource[1].toLowerCase()}/${resource[2]}` : undefined
+}
+
+const androidDefaultIcon = `data:image/svg+xml,${encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><g fill="#3ddc84"><path d="M14.4 16.4 11.6 12a.8.8 0 0 1 1.4-.8l2.9 4.5a15 15 0 0 1 16.2 0l2.9-4.5a.8.8 0 1 1 1.4.8l-2.8 4.4A13 13 0 0 1 39 27H9a13 13 0 0 1 5.4-10.6ZM15 21a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Zm18 0a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3ZM9 29h30v5a3 3 0 0 1-3 3h-1v5a2 2 0 0 1-4 0v-5H17v5a2 2 0 0 1-4 0v-5h-1a3 3 0 0 1-3-3v-5Zm-5 0a2 2 0 0 1 4 0v7a2 2 0 0 1-4 0v-7Zm36 0a2 2 0 0 1 4 0v7a2 2 0 0 1-4 0v-7Z"/></g></svg>',
+)}`
+
+function svgDataURL(svg: string): string {
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`
+}
+
+function androidAttribute(element: Element, name: string): string | null {
+  return element.getAttribute(`android:${name}`) ??
+    element.getAttributeNS('http://schemas.android.com/apk/res/android', name)
+}
+
+function androidColorToCSS(color: string): string {
+  const hex = color.match(/^#([0-9a-f]{3,8})$/i)?.[1]
+  if (!hex) return color
+  if (hex.length === 4) {
+    const [alpha, red, green, blue] = hex
+    return `#${red}${red}${green}${green}${blue}${blue}${alpha}${alpha}`
+  }
+  if (hex.length === 8) return `#${hex.slice(2)}${hex.slice(0, 2)}`
+  return color
+}
+
+function vectorDrawableDataURL(source: string, colors: Map<string, string> = new Map()): string | null {
+  const document = new DOMParser().parseFromString(source, 'application/xml')
+  const root = document.documentElement
+  if (root.localName !== 'vector') return null
+  const width = Number.parseFloat(androidAttribute(root, 'width') ?? '24')
+  const height = Number.parseFloat(androidAttribute(root, 'height') ?? '24')
+  const viewportWidth = Number.parseFloat(androidAttribute(root, 'viewportWidth') ?? String(width))
+  const viewportHeight = Number.parseFloat(androidAttribute(root, 'viewportHeight') ?? String(height))
+  if (![width, height, viewportWidth, viewportHeight].every(Number.isFinite) ||
+      width <= 0 || height <= 0 || viewportWidth <= 0 || viewportHeight <= 0) return null
+
+  const renderNode = (node: Element): string => {
+    if (node.localName === 'path') {
+      const pathData = androidAttribute(node, 'pathData')
+      if (!pathData) return ''
+      const fill = androidAttribute(node, 'fillColor')
+      const stroke = androidAttribute(node, 'strokeColor')
+      const fillAlpha = Number.parseFloat(androidAttribute(node, 'fillAlpha') ?? '1')
+      const strokeAlpha = Number.parseFloat(androidAttribute(node, 'strokeAlpha') ?? '1')
+      const fillType = androidAttribute(node, 'fillType')
+      const fillColor = fill?.startsWith('@color/') ? colors.get(fill.slice('@color/'.length)) : fill
+      const strokeColor = stroke?.startsWith('@color/') ? colors.get(stroke.slice('@color/'.length)) : stroke
+      const resolvedFill = fillColor ? androidColorToCSS(fillColor) : fillColor
+      const resolvedStroke = strokeColor ? androidColorToCSS(strokeColor) : strokeColor
+      const attributes = [
+        `d="${pathData.replaceAll('&', '&amp;').replaceAll('"', '&quot;')}"`,
+        resolvedFill && !resolvedFill.startsWith('@') && !resolvedFill.startsWith('?') ? `fill="${resolvedFill}"` : 'fill="none"',
+        resolvedStroke && !resolvedStroke.startsWith('@') && !resolvedStroke.startsWith('?') ? `stroke="${resolvedStroke}"` : '',
+        androidAttribute(node, 'strokeWidth') ? `stroke-width="${androidAttribute(node, 'strokeWidth')}"` : '',
+        Number.isFinite(fillAlpha) && fillAlpha < 1 ? `fill-opacity="${fillAlpha}"` : '',
+        Number.isFinite(strokeAlpha) && strokeAlpha < 1 ? `stroke-opacity="${strokeAlpha}"` : '',
+        fillType === 'evenOdd' ? 'fill-rule="evenodd"' : '',
+      ].filter(Boolean).join(' ')
+      return `<path ${attributes}/>`
+    }
+    if (node.localName === 'group') {
+      const rotation = Number.parseFloat(androidAttribute(node, 'rotation') ?? '0')
+      const pivotX = Number.parseFloat(androidAttribute(node, 'pivotX') ?? '0')
+      const pivotY = Number.parseFloat(androidAttribute(node, 'pivotY') ?? '0')
+      const scaleX = Number.parseFloat(androidAttribute(node, 'scaleX') ?? '1')
+      const scaleY = Number.parseFloat(androidAttribute(node, 'scaleY') ?? '1')
+      const translateX = Number.parseFloat(androidAttribute(node, 'translateX') ?? '0')
+      const translateY = Number.parseFloat(androidAttribute(node, 'translateY') ?? '0')
+      const transform = `translate(${translateX} ${translateY}) translate(${pivotX} ${pivotY}) rotate(${rotation}) scale(${scaleX} ${scaleY}) translate(${-pivotX} ${-pivotY})`
+      return `<g transform="${transform}">${Array.from(node.children, renderNode).join('')}</g>`
+    }
+    if (node.localName === 'clip-path') {
+      const pathData = androidAttribute(node, 'pathData')
+      return pathData ? `<path d="${pathData.replaceAll('&', '&amp;').replaceAll('"', '&quot;')}" clip-rule="evenodd"/>` : ''
+    }
+    return Array.from(node.children, renderNode).join('')
+  }
+  const paths = Array.from(root.children, renderNode).join('')
+  return svgDataURL(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${viewportWidth} ${viewportHeight}">${paths}</svg>`)
+}
+
+const resourceDirectories = [
+  'mipmap-anydpi-v26', 'mipmap-anydpi', 'mipmap-xxxhdpi', 'mipmap-xxhdpi',
+  'mipmap-xhdpi', 'mipmap-hdpi', 'mipmap-mdpi', 'mipmap-nodpi', 'mipmap',
+  'drawable-anydpi-v26', 'drawable-anydpi', 'drawable-xxxhdpi', 'drawable-xxhdpi',
+  'drawable-xhdpi', 'drawable-hdpi', 'drawable-mdpi', 'drawable-nodpi', 'drawable',
+]
+const resourceExtensions = ['xml', 'png', 'webp', 'jpg', 'jpeg']
+
+async function projectIconURL(project: Project): Promise<string | null> {
+  const match = project.iconResource?.match(/^@(mipmap|drawable)\/([A-Za-z0-9_]+)$/)
+  if (!match) return null
+
+  const getFile = async (type: 'mipmap' | 'drawable', name: string) => {
+    const paths = resourceDirectories
+      .filter(directory => directory.startsWith(type))
+      .flatMap(directory => resourceExtensions.map(extension => `app/src/main/res/${directory}/${name}.${extension}`))
+    const files = await db.files.where('[projectId+path]').anyOf(paths.map(path => [project.id, path])).toArray()
+    const byPath = new Map(files.map(file => [file.path, file]))
+    return paths.map(path => byPath.get(path)).find(Boolean)
+  }
+
+  const colorNames = new Set<string>()
+  const resolveColor = async (name: string): Promise<string | undefined> => {
+    const paths = ['values', 'values-night', 'values-v21', 'values-night-v21']
+      .flatMap(directory => [`app/src/main/res/${directory}/colors.xml`, `app/src/main/res/${directory}/${name}.xml`])
+    const files = await db.files.where('[projectId+path]').anyOf(paths.map(path => [project.id, path])).toArray()
+    for (const file of files) {
+      if (!file.content) continue
+      const document = new DOMParser().parseFromString(file.content, 'application/xml')
+      const color = Array.from(document.getElementsByTagName('color'))
+        .find(element => element.getAttribute('name') === name)?.textContent?.trim()
+      if (color) return color
+    }
+    return undefined
+  }
+
+  const toDataURL = async (type: 'mipmap' | 'drawable', name: string, seen = new Set<string>()): Promise<string | null> => {
+    const key = `${type}/${name}`
+    if (seen.has(key)) return null
+    seen.add(key)
+    const file = await getFile(type, name)
+    if (!file) return null
+    if (!file.path.endsWith('.xml')) {
+      if (!file.binary) return null
+      const extension = file.path.split('.').pop()?.toLowerCase() ?? ''
+      const mimeType = ({
+        png: 'image/png', webp: 'image/webp', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+      }[extension] ?? file.binary.type)
+      if (!mimeType) return null
+      const binary = file.binary
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : null)
+        reader.onerror = () => reject(reader.error ?? new Error('Gagal membaca berkas ikon proyek.'))
+        reader.readAsDataURL(new Blob([binary], { type: mimeType }))
+      })
+    }
+
+    const source = file.content
+    if (!source) return null
+    const document = new DOMParser().parseFromString(source, 'application/xml')
+    const root = document.documentElement
+    if (root.localName === 'vector') {
+      const references = [...source.matchAll(/@color\/([A-Za-z0-9_]+)/g)].map(reference => reference[1])
+      await Promise.all(references.map(async color => {
+        if (colorNames.has(color)) return
+        colorNames.add(color)
+        const value = await resolveColor(color)
+        if (value) colorValues.set(color, value)
+      }))
+      return vectorDrawableDataURL(source, colorValues)
+    }
+    if (root.localName !== 'adaptive-icon') return null
+
+    const drawable = (element: Element | undefined) => element ? androidAttribute(element, 'drawable') : null
+    const background = drawable(Array.from(root.children).find(child => child.localName === 'background'))
+    const foreground = drawable(Array.from(root.children).find(child => child.localName === 'foreground'))
+    const resolveReference = async (reference: string | null): Promise<string | null> => {
+      const resource = reference?.match(/^@(mipmap|drawable)\/([A-Za-z0-9_]+)$/)
+      if (resource) {
+        const resourceType = resource[1] === 'mipmap' ? 'mipmap' : 'drawable'
+        return toDataURL(resourceType, resource[2], seen)
+      }
+      const color = reference?.match(/^@color\/([A-Za-z0-9_]+)$/)
+      if (color) {
+        const value = await resolveColor(color[1])
+        return value ? androidColorToCSS(value) : null
+      }
+      return reference && /^#[\da-f]{3,8}$/i.test(reference) ? androidColorToCSS(reference) : null
+    }
+    const [backgroundValue, foregroundValue] = await Promise.all([
+      resolveReference(background), resolveReference(foreground),
+    ])
+    if (!backgroundValue && !foregroundValue) return null
+    const backgroundSVG = backgroundValue?.startsWith('#')
+      ? `<rect width="100%" height="100%" fill="${backgroundValue}"/>`
+      : ''
+    const foregroundSVG = foregroundValue && !foregroundValue.startsWith('#')
+      ? `<image href="${foregroundValue.replaceAll('&', '&amp;').replaceAll('"', '&quot;')}" x="16.67%" y="16.67%" width="66.66%" height="66.66%" preserveAspectRatio="xMidYMid meet"/>`
+      : ''
+    return svgDataURL(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108">${backgroundSVG}${foregroundSVG}</svg>`)
+  }
+
+  const colorValues = new Map<string, string>()
+  const type = match[1] === 'mipmap' ? 'mipmap' : 'drawable'
+  return toDataURL(type, match[2])
+}
+
+function ProjectIcon({ project, className }: { project: Project; className: string }) {
+  const [loadedIcon, setLoadedIcon] = useState<{ key: string; url: string } | null>(null)
+  const iconKey = `${project.id}:${project.iconResource ?? ''}`
+  useEffect(() => {
+    let active = true
+    if (projectTypeOf(project) === 'java-library') return () => { active = false }
+    void (async () => {
+      const manifestPath = 'app/src/main/AndroidManifest.xml'
+      const manifest = await db.files.where('[projectId+path]').equals([project.id, manifestPath]).first()
+      const iconResource = manifestIconResource(manifest?.content) ?? project.iconResource
+      if (!iconResource) return
+      const url = await projectIconURL({ ...project, iconResource })
+      if (active && url) setLoadedIcon({ key: iconKey, url })
+    })().catch(error => console.error(`Gagal memuat ikon proyek ${project.name}:`, error))
+    return () => { active = false }
+  }, [iconKey, project])
+
+  if (projectTypeOf(project) === 'java-library') {
+    return <div className={className}>J</div>
+  }
+  const iconURL = loadedIcon?.key === iconKey ? loadedIcon.url : androidDefaultIcon
+  return <div className={className}><img src={iconURL} alt=""/></div>
+}
+
 function buildArtifactLabel(variant: BuildVariant): string {
   return variant === 'jar' || variant === 'fat-jar' ? 'JAR' : 'APK'
 }
@@ -215,6 +437,10 @@ class IDEDatabase extends Dexie {
       projects: 'id, name, updatedAt',
       files: 'id, projectId, path, updatedAt',
     })
+    this.version(2).stores({
+      projects: 'id, name, updatedAt',
+      files: 'id, projectId, path, updatedAt, [projectId+path]',
+    })
   }
 }
 
@@ -248,7 +474,8 @@ function emptyTemplate(project: Project): ProjectFile[] {
     'build.gradle.kts': `plugins {\n    id("com.android.application") version "8.7.3" apply false\n    ${project.language === 'kotlin' ? 'id("org.jetbrains.kotlin.android") version "2.0.21" apply false' : ''}\n}\n`,
     'gradle.properties': `org.gradle.jvmargs=-Xmx2048m\nandroid.useAndroidX=true\nkotlin.code.style=official\n`,
     'app/build.gradle.kts': `plugins {\n    id("com.android.application")${project.language === 'kotlin' ? '\n    id("org.jetbrains.kotlin.android")' : ''}\n}\n\nandroid {\n    namespace = "${project.packageName}"\n    compileSdk = ${project.targetSdk}\n\n    compileOptions {\n        sourceCompatibility = JavaVersion.VERSION_17\n        targetCompatibility = JavaVersion.VERSION_17\n    }\n${project.language === 'kotlin' ? '\n    kotlinOptions {\n        jvmTarget = "17"\n    }\n' : ''}\n    defaultConfig {\n        applicationId = "${project.packageName}"\n        minSdk = ${project.minSdk}\n        targetSdk = ${project.targetSdk}\n        versionCode = 1\n        versionName = "1.0"\n    }\n\n    buildTypes {\n        release {\n            isMinifyEnabled = false\n        }\n    }\n}\n\ndependencies {\n    implementation("androidx.core:core-ktx:1.13.1")\n    implementation("androidx.appcompat:appcompat:1.7.0")\n    implementation("com.google.android.material:material:1.12.0")\n    implementation("androidx.constraintlayout:constraintlayout:2.1.4")\n}\n\nconfigurations.all {\n    exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk7")\n    exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk8")\n}\n`,
-    'app/src/main/AndroidManifest.xml': `<?xml version="1.0" encoding="utf-8"?>\n<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <application\n        android:allowBackup="true"\n        android:label="@string/app_name"\n        android:theme="@style/Theme.MyApp">\n        <activity android:name=".MainActivity" android:exported="true">\n            <intent-filter>\n                <action android:name="android.intent.action.MAIN"/>\n                <category android:name="android.intent.category.LAUNCHER"/>\n            </intent-filter>\n        </activity>\n    </application>\n</manifest>\n`,
+    'app/src/main/AndroidManifest.xml': `<?xml version="1.0" encoding="utf-8"?>\n<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <application\n        android:allowBackup="true"\n        android:icon="@drawable/ic_launcher"\n        android:label="@string/app_name"\n        android:theme="@style/Theme.MyApp">\n        <activity android:name=".MainActivity" android:exported="true">\n            <intent-filter>\n                <action android:name="android.intent.action.MAIN"/>\n                <category android:name="android.intent.category.LAUNCHER"/>\n            </intent-filter>\n        </activity>\n    </application>\n</manifest>\n`,
+    'app/src/main/res/drawable/ic_launcher.xml': `<?xml version="1.0" encoding="utf-8"?>\n<vector xmlns:android="http://schemas.android.com/apk/res/android"\n    android:width="48dp"\n    android:height="48dp"\n    android:viewportWidth="48"\n    android:viewportHeight="48">\n    <path\n        android:fillColor="#3DDC84"\n        android:pathData="M14.4,16.4L11.6,12a0.8,0.8 0,0 1,1.4 -0.8l2.9,4.5a15,15 0,0 1,16.2 0l2.9,-4.5a0.8,0.8 0,1 1,1.4 0.8l-2.8,4.4A13,13 0,0 1,39 27L9,27a13,13 0,0 1,5.4 -10.6ZM15,21a1.5,1.5 0,1 0,0 -3a1.5,1.5 0,0 0,0 3ZM33,21a1.5,1.5 0,1 0,0 -3a1.5,1.5 0,0 0,0 3ZM9,29L39,29v5a3,3 0,0 1,-3 3h-1v5a2,2 0,0 1,-4 0v-5L17,37v5a2,2 0,0 1,-4 0v-5h-1a3,3 0,0 1,-3 -3zM4,29a2,2 0,0 1,4 0v7a2,2 0,0 1,-4 0zM40,29a2,2 0,0 1,4 0v7a2,2 0,0 1,-4 0z" />\n</vector>\n`,
     'app/src/main/res/layout/activity_main.xml': `<?xml version="1.0" encoding="utf-8"?>\n<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto" android:layout_width="match_parent" android:layout_height="match_parent">\n    <TextView android:id="@+id/hello_text" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/hello_world" android:textSize="24sp" app:layout_constraintBottom_toBottomOf="parent" app:layout_constraintEnd_toEndOf="parent" app:layout_constraintStart_toStartOf="parent" app:layout_constraintTop_toTopOf="parent"/>\n</androidx.constraintlayout.widget.ConstraintLayout>\n`,
     'app/src/main/res/values/strings.xml': `<resources>\n    <string name="app_name">${project.name}</string>\n    <string name="hello_world">Hello, World!</string>\n</resources>\n`,
     'app/src/main/res/values/themes.xml': `<resources>\n    <style name="Theme.MyApp" parent="Theme.Material3.DayNight.NoActionBar"/>\n</resources>\n`,
@@ -989,7 +1216,11 @@ function App() {
 
   async function createProject(data: Omit<Project, 'id' | 'createdAt' | 'updatedAt' | 'templateId'>) {
     const now = Date.now()
-    const project: Project = { ...data, id: uid(), templateId: 'empty-app', createdAt: now, updatedAt: now }
+    const project: Project = {
+      ...data,
+      iconResource: data.projectType === 'java-library' ? undefined : '@drawable/ic_launcher',
+      id: uid(), templateId: 'empty-app', createdAt: now, updatedAt: now,
+    }
     const generated = emptyTemplate(project)
     await db.projects.add(project)
     await db.files.bulkAdd(generated)
@@ -1118,6 +1349,7 @@ function App() {
       const manifestMatch = manifest?.content?.match(/<manifest[^>]*package=["']([^"']+)/)
       const project: Project = {
         id: projectId, name: projectName,
+        iconResource: manifestIconResource(manifest?.content),
         packageName: manifestMatch?.[1] || 'com.example.imported',
         language: projectFiles.some(file => file.path.endsWith('.kt')) ? 'kotlin' : 'java',
         templateId: 'imported', minSdk: 24, targetSdk: 34, createdAt: now, updatedAt: now,
@@ -1250,6 +1482,15 @@ function App() {
       setToast('Log berhasil disalin.')
     } catch (error) {
       setToast(error instanceof Error ? `Gagal menyalin log: ${error.message}` : 'Gagal menyalin log.')
+    }
+  }
+
+  async function copyValue(value: string, label: string) {
+    try {
+      await navigator.clipboard.writeText(value)
+      setToast(`${label} berhasil disalin.`)
+    } catch (error) {
+      setToast(error instanceof Error ? `Gagal menyalin ${label.toLowerCase()}: ${error.message}` : `Gagal menyalin ${label.toLowerCase()}.`)
     }
   }
 
@@ -1609,7 +1850,7 @@ function App() {
             {projects.map(project => (
               <article className="project-card" key={project.id}>
                 <button className="project-open" onClick={() => { setMonitorDashboardOpen(false); setActiveProjectId(project.id) }}>
-                  <div className="app-icon">{projectTypeOf(project) === 'java-library' ? 'J' : 'A'}</div>
+                  <ProjectIcon project={project} className="app-icon"/>
                   <div><strong>{project.name}</strong><span>{project.packageName}</span>
                     {activeBuilds[project.id] && <AnimatedBuildStatus variant={activeBuilds[project.id].variant}/>}
                   </div>
@@ -1680,13 +1921,14 @@ function App() {
                 builds={Object.values(activeBuilds)}
                 projects={projects}
                 onOpenBuild={openBuildFromDashboard}
+                onCopyURL={copyValue}
               />
             ) : (
               <div className="project-grid">
               {projects.map(project => (
                 <article className="project-card large" key={project.id}>
                   <button className="project-open" onClick={() => setActiveProjectId(project.id)}>
-                    <div className="app-icon large-icon">{projectTypeOf(project) === 'java-library' ? 'J' : project.name[0]?.toUpperCase()}</div>
+                    <ProjectIcon project={project} className="app-icon large-icon"/>
                     <div><strong>{project.name}</strong><span>{projectTypeOf(project) === 'java-library' ? 'PUSTAKA JAVA' : `${project.language.toUpperCase()} • SDK ${project.minSdk}+`}</span><small>{project.packageName}</small>
                       {activeBuilds[project.id] && <AnimatedBuildStatus variant={activeBuilds[project.id].variant}/>}
                     </div>
@@ -1798,6 +2040,7 @@ function App() {
           history={buildMetricsHistory}
           onBack={() => { setFullLogOpen(false); setBuildOpen(true) }}
           onCopy={copyLogs}
+          onCopyURL={copyValue}
         />
       )}
       {storageOpen && (
@@ -1884,17 +2127,32 @@ function ResourceTile({ title, value, detail, percent, history, color }: {
   )
 }
 
-function MonitorDashboard({ metrics, history, error, builds, projects, onOpenBuild }: {
+function CopyValueButton({ value, label, onCopy }: {
+  value: string
+  label: string
+  onCopy: (value: string, label: string) => void
+}) {
+  return (
+    <button className="icon-btn copy-url-btn" title={`Salin ${label}`} aria-label={`Salin ${label}`}
+      onClick={() => onCopy(value, label)}>
+      <Copy size={15}/>
+    </button>
+  )
+}
+
+function MonitorDashboard({ metrics, history, error, builds, projects, onOpenBuild, onCopyURL }: {
   metrics: HostResourceMetrics | null
   history: MetricHistoryPoint[]
   error: string
   builds: Build[]
   projects: Project[]
   onOpenBuild: (build: Build) => void
+  onCopyURL: (value: string, label: string) => void
 }) {
   const projectNames = new Map(projects.map(project => [project.id, project.name]))
   const cpuHistory = history.map(point => point.cpu)
   const memoryHistory = history.map(point => point.memory)
+  const hostMonitorURL = `${window.location.origin}/api/monitor/host`
   return (
     <section className="monitor-dashboard">
       <div className="monitor-dashboard-title">
@@ -1922,8 +2180,11 @@ function MonitorDashboard({ metrics, history, error, builds, projects, onOpenBui
       </div>
       <div className="monitor-api-note">
         <strong><Activity size={15}/> Endpoint server privat</strong>
-        <code>GET {window.location.origin}/api/monitor/host</code>
-        <code>curl -H 'X-API-Key: $IDE_API_KEY' '{window.location.origin}/api/monitor/host'</code>
+        <div className="monitor-api-url">
+          <code>GET {hostMonitorURL}</code>
+          <CopyValueButton value={hostMonitorURL} label="URL monitor server" onCopy={onCopyURL}/>
+        </div>
+        <code>curl -H 'X-API-Key: $IDE_API_KEY' '{hostMonitorURL}'</code>
       </div>
       <div className="monitor-builds-head"><h3>Build aktif</h3><span>{builds.length}</span></div>
       {builds.length === 0 ? <div className="monitor-build-empty">Tidak ada build yang sedang berjalan.</div> : (
@@ -1967,7 +2228,7 @@ function BuildResourcePanel({ metrics, history }: {
   )
 }
 
-function BuildLogScreen({ buildId, authMode, variant, status, logs, metrics, history, onBack, onCopy }: {
+function BuildLogScreen({ buildId, authMode, variant, status, logs, metrics, history, onBack, onCopy, onCopyURL }: {
   buildId: string
   authMode: AuthStatus['mode']
   variant: BuildVariant
@@ -1977,8 +2238,9 @@ function BuildLogScreen({ buildId, authMode, variant, status, logs, metrics, his
   history: MetricHistoryPoint[]
   onBack: () => void
   onCopy: () => void
+  onCopyURL: (value: string, label: string) => void
 }) {
-  const apiURL = `${window.location.origin}/api/monitor/builds/${encodeURIComponent(buildId)}`
+  const apiURL = `${window.location.origin}/api/monitor/builds/${encodeURIComponent(buildId)}/logs`
   return (
     <section className="build-log-screen">
       <header className="build-log-screen-head">
@@ -1988,11 +2250,14 @@ function BuildLogScreen({ buildId, authMode, variant, status, logs, metrics, his
       </header>
       {authMode === 'private' && <BuildResourcePanel metrics={metrics} history={history}/>}
       <div className="build-log-api">
-        <span>Pemantauan API</span>
-        <code>GET {apiURL}</code>
+        <span>Stream log build · SSE</span>
+        <div className="build-log-api-url">
+          <code>GET {apiURL}</code>
+          <CopyValueButton value={apiURL} label="URL stream log build" onCopy={onCopyURL}/>
+        </div>
         <code>{authMode === 'private'
-          ? `curl -H 'X-API-Key: $IDE_API_KEY' '${apiURL}'`
-          : `curl '${apiURL}'`}</code>
+          ? `curl -N -H 'X-API-Key: $IDE_API_KEY' '${apiURL}'`
+          : `curl -N '${apiURL}'`}</code>
         {status !== 'building' && status !== 'queued' && status !== 'preparing' && status !== 'assembling' &&
           <a className="download-btn" href={`/api/builds/${encodeURIComponent(buildId)}/artifact`} download>
             <Download size={15}/>Unduh {buildArtifactLabel(variant)}

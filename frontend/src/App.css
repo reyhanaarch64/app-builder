@@ -52,6 +52,7 @@ small { color:var(--muted); font-size:10px; font-weight:800; letter-spacing:1.3p
 .project-open strong,.project-open small { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .project-open span { color:var(--muted); font-size:11px; margin-top:3px; }
 .app-icon { width:42px; height:42px; flex:none; display:grid; place-items:center; border-radius:10px; background:linear-gradient(135deg,#46cfa6,#267e71); color:#06130f; font-weight:900; }
+.app-icon img { width:100%; height:100%; object-fit:contain; padding:7px; }
 .empty-state { height:180px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:7px; color:#596577; text-align:center; }
 .empty-state strong { color:#aab4c1; }
 .empty-state span { font-size:12px; }
@@ -78,6 +79,10 @@ small { color:var(--muted); font-size:10px; font-weight:800; letter-spacing:1.3p
 .monitor-api-note { display:flex; flex-direction:column; gap:7px; border:1px solid var(--line); border-radius:10px; background:#10151b; padding:12px; }
 .monitor-api-note strong { display:flex; align-items:center; gap:7px; color:#cbd6e3; font-size:12px; }
 .monitor-api-note code,.build-log-api code { overflow-wrap:anywhere; color:#8fc8ff; font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+.monitor-api-url,.build-log-api-url { min-width:0; display:flex; align-items:center; gap:6px; }
+.monitor-api-url code,.build-log-api-url code { flex:1; min-width:0; }
+.copy-url-btn { width:32px; height:32px; flex:none; border:1px solid var(--line); background:#151b23; color:#9fb0c2; }
+.copy-url-btn:hover { border-color:#465463; color:#fff; }
 .monitor-builds-head { justify-content:flex-start; margin-top:3px; }
 .monitor-builds-head h3 { margin:0; font-size:14px; }
 .monitor-builds-head > span { min-width:23px; height:23px; display:grid; place-items:center; border-radius:12px; background:#1b2935; color:#bcd2e8; font-size:11px; }
@@ -107,6 +112,7 @@ small { color:var(--muted); font-size:10px; font-weight:800; letter-spacing:1.3p
 .build-log-title strong { color:#e5edf7; font-size:13px; text-transform:capitalize; }
 .build-log-api { display:flex; flex-wrap:wrap; align-items:center; gap:8px 14px; border-bottom:1px solid var(--line); background:#10151b; padding:10px 16px; }
 .build-log-api > span { color:var(--muted); font-size:11px; }
+.build-log-api-url { flex:1 1 100%; }
 .build-log-api .download-btn { width:auto; height:30px; margin:0 0 0 auto; padding:0 10px; font-size:11px; }
 .full-log-view { height:auto; flex:1; min-height:0; }
 .full-log-view div { grid-template-columns:54px minmax(0,1fr); padding:2px 16px; white-space:pre-wrap; overflow-wrap:anywhere; }
