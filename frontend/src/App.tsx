@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import Editor from '@monaco-editor/react'
+import type { editor as MonacoEditor } from 'monaco-editor'
 import Dexie, { type Table } from 'dexie'
 import JSZip from 'jszip'
 import {
-  Activity, Archive, ArrowLeft, Ban, Box, ChevronRight, Copy, Download, FileCode2, FilePlus2, FileText,
-  FolderPlus, Gauge, HardDrive, Mail, LogOut, Menu, PackagePlus, Play, RefreshCw, Search, Server,
-  Smartphone, Trash2, Upload, WifiOff,
+  Activity, AlertCircle, Archive, ArrowLeft, Ban, Box, ChevronRight, Copy, Download, FileCode2,
+  FilePlus2, FileText, FolderPlus, Gauge, HardDrive, Mail, LogOut, Menu, PackagePlus, Play, RefreshCw,
+  Search, Server, Smartphone, Trash2, Upload, WifiOff,
   X,
 } from 'lucide-react'
 import './App.css'
@@ -38,6 +39,22 @@ type ProjectFile = {
   size: number
   createdAt: number
   updatedAt: number
+}
+
+type EditorDiagnostic = {
+  fileId: string
+  path: string
+  line: number
+  column: number
+  message: string
+}
+
+type SearchResult = {
+  fileId: string
+  path: string
+  line: number
+  column: number
+  preview: string
 }
 
 type Build = {
@@ -164,6 +181,191 @@ const defaultExpandedPaths = ['app', 'app/src', 'app/src/main']
 
 function projectTypeOf(project: Project): ProjectType {
   return project.projectType ?? 'android'
+}
+
+function editorDiagnostics(file: ProjectFile): EditorDiagnostic[] {
+  const source = file.content
+  if (source === undefined) return []
+  const extension = file.path.split('.').pop()?.toLowerCase()
+  const diagnostic = (line: number, column: number, message: string): EditorDiagnostic => ({
+    fileId: file.id, path: file.path, line, column, message,
+  })
+
+  if (extension === 'json') {
+    try {
+      JSON.parse(source)
+      return []
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'JSON tidak valid.'
+      const position = message.match(/position\s+(\d+)/i)
+      const lineColumn = message.match(/line\s+(\d+)\s+column\s+(\d+)/i)
+      let line = Number(lineColumn?.[1] ?? 1)
+      let column = Number(lineColumn?.[2] ?? 1)
+      if (position) {
+        const beforeError = source.slice(0, Number(position[1]))
+        line = beforeError.split('\n').length
+        column = beforeError.length - beforeError.lastIndexOf('\n')
+      }
+      return [diagnostic(line, column, message)]
+    }
+  }
+
+  if (extension === 'xml') {
+    const parsed = new DOMParser().parseFromString(source, 'application/xml')
+    const parseError = parsed.getElementsByTagName('parsererror')[0]
+    if (!parseError) return []
+    const message = parseError.textContent?.trim().replace(/\s+/g, ' ') || 'XML tidak valid.'
+    const location = message.match(/line\s+(\d+).*?(?:column|col)\s+(\d+)/i)
+    return [diagnostic(Number(location?.[1] ?? 1), Number(location?.[2] ?? 1), message.slice(0, 240))]
+  }
+
+  if (!['java', 'kt', 'kts', 'gradle'].includes(extension ?? '')) return []
+  const errors: EditorDiagnostic[] = []
+  const stack: { token: string; line: number; column: number }[] = []
+  let line = 1
+  let column = 1
+  let index = 0
+  let state: 'code' | 'line-comment' | 'block-comment' | 'string' | 'multiline-string' = 'code'
+  let quote = ''
+  let blockCommentDepth = 0
+  let stringStart = { line: 1, column: 1 }
+  let commentStart = { line: 1, column: 1 }
+  const closers: Record<string, string> = { ')': '(', ']': '[', '}': '{' }
+
+  const advance = (count = 1) => {
+    for (let step = 0; step < count && index < source.length; step++) {
+      if (source[index] === '\n') {
+        line++
+        column = 1
+      } else {
+        column++
+      }
+      index++
+    }
+  }
+
+  while (index < source.length && errors.length < 100) {
+    const char = source[index]
+    const next = source[index + 1]
+    if (state === 'line-comment') {
+      if (char === '\n') state = 'code'
+      advance()
+      continue
+    }
+    if (state === 'block-comment') {
+      if (char === '/' && next === '*' && (extension === 'kt' || extension === 'kts')) {
+        blockCommentDepth++
+        advance(2)
+      } else if (char === '*' && next === '/') {
+        blockCommentDepth--
+        if (blockCommentDepth === 0) state = 'code'
+        advance(2)
+      } else {
+        advance()
+      }
+      continue
+    }
+    if (state === 'multiline-string') {
+      if (source.startsWith('"""', index)) {
+        state = 'code'
+        advance(3)
+      } else {
+        advance()
+      }
+      continue
+    }
+    if (state === 'string') {
+      if (char === '\\') {
+        advance(Math.min(2, source.length - index))
+      } else if (char === quote) {
+        state = 'code'
+        advance()
+      } else if (char === '\n') {
+        errors.push(diagnostic(stringStart.line, stringStart.column, 'String tidak ditutup sebelum akhir baris.'))
+        state = 'code'
+        advance()
+      } else {
+        advance()
+      }
+      continue
+    }
+
+    if (char === '/' && next === '/') {
+      state = 'line-comment'
+      commentStart = { line, column }
+      advance(2)
+    } else if (char === '/' && next === '*') {
+      state = 'block-comment'
+      blockCommentDepth = 1
+      commentStart = { line, column }
+      advance(2)
+    } else if (source.startsWith('"""', index)) {
+      state = 'multiline-string'
+      stringStart = { line, column }
+      advance(3)
+    } else if (char === '"' || char === "'") {
+      state = 'string'
+      quote = char
+      stringStart = { line, column }
+      advance()
+    } else if ('([{'.includes(char)) {
+      stack.push({ token: char, line, column })
+      advance()
+    } else if (closers[char]) {
+      const opening = stack.at(-1)
+      if (!opening || opening.token !== closers[char]) {
+        errors.push(diagnostic(line, column, `Kurung "${char}" tidak punya pasangan pembuka yang sesuai.`))
+      } else {
+        stack.pop()
+      }
+      advance()
+    } else {
+      advance()
+    }
+  }
+
+  if (state === 'string' || state === 'multiline-string') {
+    errors.push(diagnostic(stringStart.line, stringStart.column, 'String tidak ditutup.'))
+  } else if (state === 'block-comment') {
+    errors.push(diagnostic(commentStart.line, commentStart.column, 'Komentar blok tidak ditutup.'))
+  }
+  for (const opening of stack) {
+    if (errors.length >= 100) break
+    errors.push(diagnostic(opening.line, opening.column, `Kurung "${opening.token}" tidak ditutup.`))
+  }
+  return errors
+}
+
+function findProjectMatches(
+  files: ProjectFile[],
+  activeFileId: string,
+  scope: 'file' | 'project',
+  query: string,
+  limit = 200,
+): SearchResult[] {
+  const needle = query.trim().toLocaleLowerCase()
+  if (!needle) return []
+  const results: SearchResult[] = []
+  const candidates = scope === 'file'
+    ? files.filter(file => file.id === activeFileId)
+    : files
+  for (const file of candidates) {
+    if (file.content === undefined) continue
+    const lines = file.content.split('\n')
+    for (let index = 0; index < lines.length; index++) {
+      const lowered = lines[index].toLocaleLowerCase()
+      let column = lowered.indexOf(needle)
+      while (column !== -1) {
+        results.push({
+          fileId: file.id, path: file.path, line: index + 1,
+          column: column + 1, preview: lines[index].trim().slice(0, 240),
+        })
+        if (results.length >= limit) return results
+        column = lowered.indexOf(needle, column + needle.length)
+      }
+    }
+  }
+  return results
 }
 
 function manifestIconResource(manifest: string | undefined): string | undefined {
@@ -643,6 +845,12 @@ function App() {
   const [files, setFiles] = useState<ProjectFile[]>([])
   const [openTabs, setOpenTabs] = useState<ProjectFile[]>([])
   const [activeFileId, setActiveFileId] = useState<string | null>(null)
+  const [editorPanel, setEditorPanel] = useState<'search' | 'diagnostics' | null>(null)
+  const [editorSearchScope, setEditorSearchScope] = useState<'file' | 'project'>('project')
+  const [editorSearchQuery, setEditorSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([])
+  const [searchInProgress, setSearchInProgress] = useState(false)
+  const [editorNavigation, setEditorNavigation] = useState<{ fileId: string; line: number; column: number } | null>(null)
   const [editorStateProjectId, setEditorStateProjectId] = useState<string | null>(null)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [buildOpen, setBuildOpen] = useState(false)
@@ -694,6 +902,9 @@ function App() {
     workspaces: true, artifacts: true, history: false, gradleCache: false,
   })
   const autoSaveTimers = useRef(new Map<string, number>())
+  const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null)
+  const monacoRef = useRef<typeof import('monaco-editor') | null>(null)
+  const editorSearchInput = useRef<HTMLInputElement>(null)
   const buildEvents = useRef<EventSource | null>(null)
   const buildAbortController = useRef<AbortController | null>(null)
   const buildPrepareInFlight = useRef(false)
@@ -712,6 +923,115 @@ function App() {
     (!serverAvailable && authMode === 'private' && offlineUnlocked)
   const activeProject = projects.find(p => p.id === activeProjectId) ?? null
   const activeFile = files.find(f => f.id === activeFileId) ?? null
+  const [diagnostics, setDiagnostics] = useState<EditorDiagnostic[]>([])
+  const activeProjectFiles = useMemo(
+    () => files.filter(file => file.projectId === activeProjectId),
+    [files, activeProjectId],
+  )
+
+  useEffect(() => {
+    const viewport = window.visualViewport
+    const updateViewport = () => {
+      if (!viewport) return
+      const visibleBottom = viewport.offsetTop + viewport.height
+      const keyboardInset = Math.max(0, window.innerHeight - visibleBottom)
+      document.documentElement.style.setProperty('--visible-viewport-height', `${viewport.height}px`)
+      document.documentElement.style.setProperty('--keyboard-inset-bottom', `${keyboardInset}px`)
+    }
+    updateViewport()
+    viewport?.addEventListener('resize', updateViewport)
+    viewport?.addEventListener('scroll', updateViewport)
+    return () => {
+      viewport?.removeEventListener('resize', updateViewport)
+      viewport?.removeEventListener('scroll', updateViewport)
+      document.documentElement.style.removeProperty('--visible-viewport-height')
+      document.documentElement.style.removeProperty('--keyboard-inset-bottom')
+    }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        const found: EditorDiagnostic[] = []
+        for (let offset = 0; offset < activeProjectFiles.length; offset += 20) {
+          found.push(...activeProjectFiles.slice(offset, offset + 20).flatMap(editorDiagnostics))
+          if (offset + 20 < activeProjectFiles.length) await new Promise(resolve => window.setTimeout(resolve, 0))
+          if (cancelled) return
+        }
+        setDiagnostics(found)
+      })()
+    }, 120)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [activeProjectFiles])
+
+  useEffect(() => {
+    const editor = editorRef.current
+    const model = editor?.getModel()
+    const monaco = monacoRef.current
+    if (!editor || !model || !monaco) return
+    const markers = diagnostics
+      .filter(item => item.fileId === activeFileId)
+      .map(item => ({
+        severity: monaco.MarkerSeverity.Error,
+        message: item.message,
+        startLineNumber: Math.max(1, item.line),
+        startColumn: Math.max(1, item.column),
+        endLineNumber: Math.max(1, item.line),
+        endColumn: Math.max(2, item.column + 1),
+      }))
+    monaco.editor.setModelMarkers(model, 'android-web-ide-local-checks', markers)
+    return () => monaco.editor.setModelMarkers(model, 'android-web-ide-local-checks', [])
+  }, [diagnostics, activeFileId, activeFile?.content])
+
+  useEffect(() => {
+    if (!editorNavigation || editorNavigation.fileId !== activeFileId) return
+    const editor = editorRef.current
+    const model = editor?.getModel()
+    if (!editor || !model) return
+    const line = Math.min(Math.max(1, editorNavigation.line), model.getLineCount())
+    const column = Math.min(Math.max(1, editorNavigation.column), model.getLineMaxColumn(line))
+    editor.setPosition({ lineNumber: line, column })
+    editor.revealPositionInCenter({ lineNumber: line, column })
+    editor.focus()
+    setEditorNavigation(null)
+  }, [editorNavigation, activeFileId, activeFile?.content])
+
+  useEffect(() => {
+    if (editorPanel !== 'search' || !activeProjectId || !editorSearchQuery.trim()) {
+      setSearchResults([])
+      setSearchInProgress(false)
+      return
+    }
+    let cancelled = false
+    setSearchInProgress(true)
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        const candidates = editorSearchScope === 'file'
+          ? activeProjectFiles.filter(file => file.id === activeFileId)
+          : activeProjectFiles
+        const results: SearchResult[] = []
+        for (let offset = 0; offset < candidates.length && results.length < 200; offset += 100) {
+          results.push(...findProjectMatches(candidates.slice(offset, offset + 100), activeFileId ?? '', 'project', editorSearchQuery, 200 - results.length))
+          if (offset + 100 < candidates.length) await new Promise(resolve => window.setTimeout(resolve, 0))
+          if (cancelled) return
+        }
+        setSearchResults(results)
+        setSearchInProgress(false)
+      })()
+    }, 180)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [activeProjectId, activeFileId, activeProjectFiles, editorPanel, editorSearchQuery, editorSearchScope])
+
+  useEffect(() => {
+    if (editorPanel === 'search') editorSearchInput.current?.focus()
+  }, [editorPanel])
 
   useEffect(() => {
     let disposed = false
@@ -1247,6 +1567,31 @@ function App() {
     if (existingTimer) window.clearTimeout(existingTimer)
     const timer = window.setTimeout(() => saveFile(activeFile, content), 800)
     autoSaveTimers.current.set(activeFile.id, timer)
+  }
+
+  function insertEditorText(value: string, closing?: string) {
+    const editor = editorRef.current
+    const model = editor?.getModel()
+    const selection = editor?.getSelection()
+    if (!editor || !model || !selection) return
+    const selectedText = model.getValueInRange(selection)
+    const startOffset = model.getOffsetAt(selection.getStartPosition())
+    const text = closing ? `${value}${selectedText}${closing}` : value
+    editor.executeEdits('editor-helper-toolbar', [{
+      range: selection,
+      text,
+      forceMoveMarkers: true,
+    }])
+    if (closing) {
+      const start = model.getPositionAt(startOffset + value.length)
+      const end = model.getPositionAt(startOffset + value.length + selectedText.length)
+      if (selectedText) editor.setSelection({
+        startLineNumber: start.lineNumber, startColumn: start.column,
+        endLineNumber: end.lineNumber, endColumn: end.column,
+      })
+      else editor.setPosition(start)
+    }
+    editor.focus()
   }
 
   async function openFile(file: ProjectFile) {
@@ -1881,14 +2226,105 @@ function App() {
               {openTabs.length === 0 && <div className="tab-placeholder">Pilih file dari explorer</div>}
             </div>
             {activeFile ? (
-              <Editor
-                height="calc(100vh - 110px)"
-                language={activeFile.path.endsWith('.kt') ? 'kotlin' : activeFile.path.endsWith('.java') ? 'java' : activeFile.path.endsWith('.xml') ? 'xml' : activeFile.path.endsWith('.json') ? 'json' : activeFile.path.endsWith('.gradle') || activeFile.path.endsWith('.kts') ? 'gradle' : 'plaintext'}
-                value={activeFile.content ?? ''}
-                theme="vs-dark"
-                onChange={editFile}
-                options={{ fontSize: 14, lineNumbers: 'on', minimap: { enabled: false }, wordWrap: 'on', automaticLayout: true, padding: { top: 12 } }}
-              />
+              <>
+                <div className="editor-command-row">
+                  <button className={`icon-btn ${editorPanel === 'search' ? 'active' : ''}`} title="Cari di proyek" aria-label="Cari di proyek"
+                    onClick={() => setEditorPanel(panel => panel === 'search' ? null : 'search')}><Search size={16}/></button>
+                  <button className={`icon-btn ${editorPanel === 'diagnostics' ? 'active' : ''}`} title="Lihat pemeriksaan kode" aria-label={`Lihat pemeriksaan kode, ${diagnostics.length} masalah`}
+                    onClick={() => setEditorPanel(panel => panel === 'diagnostics' ? null : 'diagnostics')}>
+                    <AlertCircle size={16}/>{diagnostics.length > 0 && <span className="diagnostic-count">{diagnostics.length}</span>}
+                  </button>
+                  <span className="editor-file-path">{activeFile.path}</span>
+                  {editorPanel && <button className="icon-btn editor-panel-close" title="Tutup panel" aria-label="Tutup panel"
+                    onClick={() => setEditorPanel(null)}><X size={15}/></button>}
+                </div>
+                {editorPanel === 'search' && (
+                  <section className="editor-panel">
+                    <div className="editor-search-controls">
+                      <input ref={editorSearchInput} value={editorSearchQuery} aria-label="Kata yang dicari"
+                        placeholder="Cari teks di proyek ini" onChange={event => setEditorSearchQuery(event.target.value)}/>
+                      <div className="editor-search-scope">
+                        <button className={editorSearchScope === 'file' ? 'selected' : ''}
+                          onClick={() => setEditorSearchScope('file')}>File aktif</button>
+                        <button className={editorSearchScope === 'project' ? 'selected' : ''}
+                          onClick={() => setEditorSearchScope('project')}>Proyek</button>
+                      </div>
+                    </div>
+                    <div className="editor-result-list">
+                      {searchInProgress ? <span className="editor-panel-hint">Mencari…</span> : searchResults.length > 0
+                        ? searchResults.map((result, index) => (
+                          <button className="editor-result" key={`${result.fileId}:${result.line}:${result.column}:${index}`}
+                            onClick={() => {
+                              setEditorNavigation({ fileId: result.fileId, line: result.line, column: result.column })
+                              setEditorPanel(null)
+                              const file = activeProjectFiles.find(candidate => candidate.id === result.fileId)
+                              if (file) void openFile(file)
+                            }}>
+                            <span className="editor-result-location">{result.path}:{result.line}</span>
+                            <code>{result.preview}</code>
+                          </button>
+                        ))
+                        : <span className="editor-panel-hint">{editorSearchQuery.trim() ? 'Tidak ada hasil di proyek ini.' : 'Ketik kata atau teks yang mau dicari.'}</span>}
+                      {searchResults.length === 200 && <span className="editor-panel-hint">Menampilkan maksimal 200 hasil.</span>}
+                    </div>
+                  </section>
+                )}
+                {editorPanel === 'diagnostics' && (
+                  <section className="editor-panel">
+                    <div className="editor-diagnostic-list">
+                      {diagnostics.length === 0 ? <span className="editor-panel-hint">Tidak ditemukan kurung, string, JSON, atau XML yang belum ditutup.</span>
+                        : diagnostics.map((item, index) => (
+                          <button className="editor-result editor-diagnostic" key={`${item.fileId}:${item.line}:${item.column}:${index}`}
+                            onClick={() => {
+                              setEditorNavigation({ fileId: item.fileId, line: item.line, column: item.column })
+                              setEditorPanel(null)
+                              const file = activeProjectFiles.find(candidate => candidate.id === item.fileId)
+                              if (file) void openFile(file)
+                            }}>
+                            <span className="editor-result-location">{item.path}:{item.line}:{item.column}</span>
+                            <code>{item.message}</code>
+                          </button>
+                        ))}
+                    </div>
+                    <span className="editor-panel-hint">Pemeriksaan lokal dasar; bukan pengganti compiler atau language server.</span>
+                  </section>
+                )}
+                <div className="editor-canvas">
+                  <Editor
+                    height="100%"
+                    language={activeFile.path.endsWith('.kt') ? 'kotlin' : activeFile.path.endsWith('.java') ? 'java' : activeFile.path.endsWith('.xml') ? 'xml' : activeFile.path.endsWith('.json') ? 'json' : activeFile.path.endsWith('.gradle') || activeFile.path.endsWith('.kts') ? 'gradle' : 'plaintext'}
+                    value={activeFile.content ?? ''}
+                    theme="vs-dark"
+                    onChange={editFile}
+                    onMount={(editor, monaco) => {
+                      editorRef.current = editor
+                      monacoRef.current = monaco
+                      editor.onDidDispose(() => {
+                        if (editorRef.current === editor) {
+                          editorRef.current = null
+                          monacoRef.current = null
+                        }
+                      })
+                    }}
+                    options={{ fontSize: 14, lineNumbers: 'on', minimap: { enabled: false }, wordWrap: 'on', automaticLayout: true, padding: { top: 12 } }}
+                  />
+                </div>
+                <div className="editor-helper-bar" aria-label="Tombol karakter editor">
+                  {[
+                    { label: '{}', value: '{', closing: '}' },
+                    { label: '()', value: '(', closing: ')' },
+                    { label: '[]', value: '[', closing: ']' },
+                    { label: '""', value: '"', closing: '"' },
+                    { label: "''", value: "'", closing: "'" },
+                    { label: ';', value: ';' },
+                    { label: ',', value: ',' },
+                    { label: '=', value: '=' },
+                  ].map(button => (
+                    <button key={button.label} onClick={() => insertEditorText(button.value, button.closing)}
+                      aria-label={`Masukkan ${button.label}`}>{button.label}</button>
+                  ))}
+                </div>
+              </>
             ) : <div className="editor-empty"><FileCode2 size={44}/><strong>Editor siap</strong><span>Buka file untuk mulai mengedit.</span></div>}
           </>
         ) : (
